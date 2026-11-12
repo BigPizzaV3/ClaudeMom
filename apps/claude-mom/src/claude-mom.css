@@ -256,3 +256,32 @@ svg { width: 14px; height: 14px; flex: none; }
 .cm-update-chip { margin-left: 4px; padding: 0 8px; height: 18px; border: 0; border-radius: 9px; background: var(--cm-accent-soft); color: var(--cm-accent); font-size: 11px; cursor: default; }
 button.cm-update-chip:hover { background: var(--cm-accent); color: #fff; }
 .cm-update-notes { margin: 0; max-height: 140px; overflow: auto; padding: 8px; border-radius: var(--cm-radius); background: var(--cm-bg); font: 11.5px/1.5 var(--cm-font); white-space: pre-wrap; user-select: text; }
+
+/* ── 简化版：卡片 + 折叠 ─────────────────── */
+.cm-card { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; border: 1px solid var(--cm-line); border-radius: 8px; background: var(--cm-panel); }
+.cm-card-label { font-size: 12px; font-weight: 600; color: var(--cm-muted); }
+.cm-card-line { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.cm-card-line select, .cm-card-line input {
+  height: 30px; padding: 0 8px; border: 1px solid var(--cm-line-strong); border-radius: var(--cm-radius); background: var(--cm-panel);
+}
+.cm-grow { flex: 1; min-width: 0; }
+.cm-mono { font-family: var(--cm-mono); font-size: 12px; }
+.cm-ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+.cm-link { border: 0; background: transparent; padding: 0; color: var(--cm-accent); font-size: 12.5px; white-space: nowrap; }
+.cm-link:hover:not(:disabled) { text-decoration: underline; }
+.cm-link:disabled { color: var(--cm-muted); }
+.cm-more { border: 1px solid var(--cm-line); border-radius: 8px; background: var(--cm-panel); }
+.cm-more > summary {
+  list-style: none; display: flex; align-items: center; gap: 6px; padding: 10px 14px;
+  font-size: 12.5px; color: var(--cm-muted); cursor: default; user-select: none;
+}
+.cm-more > summary::-webkit-details-marker { display: none; }
+.cm-more > summary::before { content: "›"; display: inline-block; width: 10px; transition: transform 0.15s; }
+.cm-more[open] > summary::before { transform: rotate(90deg); }
+.cm-more[open] > summary { color: var(--cm-text); }
+.cm-more > :not(summary) { margin: 0 14px; }
+.cm-more > :last-child { margin-bottom: 12px; }
+.cm-more .cm-form, .cm-more .cm-toggle-row { margin-top: 2px; }
+.cm-settings { gap: 12px; }
+.cm-editor { gap: 12px; }
+.cm-about { display: flex; align-items: center; gap: 10px; padding: 4px 2px; font-size: 12px; color: var(--cm-muted); }

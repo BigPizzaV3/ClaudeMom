@@ -40,6 +40,12 @@ export function ClaudeMomApp() {
   const pending = useRef(false);
 
   const say = (text: string, tone: "ok" | "error" = "ok") => setNotice(text ? { text, tone } : null);
+  // 提示过一会儿自己消失：成功的 5 秒，出错的 12 秒。
+  useEffect(() => {
+    if (!notice) return;
+    const timer = setTimeout(() => setNotice(null), notice.tone === "error" ? 12000 : 5000);
+    return () => clearTimeout(timer);
+  }, [notice]);
   const [version, setVersion] = useState("");
   const [update, setUpdate] = useState<UpdateState>({ phase: "idle" });
 
@@ -264,10 +270,9 @@ export function ClaudeMomApp() {
         <header className="cm-toolbar" data-tauri-drag-region>
           <span className="cm-dot" data-tone={state.tone} />
           <div className="cm-toolbar-text" data-tauri-drag-region>
-            <strong>Claude Desktop · {state.text}</strong>
+            <strong>{state.text}</strong>
             <span>
-              {status?.supported ? `版本 ${status.version || "未知"}` : "需要先安装官方 Claude Desktop"}
-              {active ? ` · ${active.name} · ${active.model ? modelLabel(active, active.model) : "未选模型"} · 窗口 ${formatWindow(active.contextWindow)}` : ""}
+              {!status?.supported && status ? "需要先安装官方 Claude Desktop" : active ? `${active.name} · ${active.model ? modelLabel(active, active.model) : "未选模型"}` : "还没有上游"}
             </span>
           </div>
           <div className="cm-toolbar-actions">
@@ -347,7 +352,6 @@ export function ClaudeMomApp() {
 
         <footer className="cm-status">
           <span>{status?.port ? `本地服务 · 端口 ${status.port}` : "本地服务未运行"}</span>
-          <span>{book.profiles.length} 组上游</span>
           {update.phase === "available" ? (
             <button className="cm-update-chip" onClick={() => void runInstall()} type="button">新版本 {update.version}，点此更新</button>
           ) : update.phase === "downloading" ? (
@@ -426,9 +430,12 @@ function UpstreamEditor({ draft, active, dirty, busy, onChange, onSave, onActiva
 }) {
   const [showKey, setShowKey] = useState(false);
   const [newModel, setNewModel] = useState("");
+  // 地址和 Key 填好以后很少改：默认收成一行，新建或没填时才展开。
+  const [editConnection, setEditConnection] = useState(!draft.id || !draft.baseUrl);
+  useEffect(() => setEditConnection(!draft.id || !draft.baseUrl), [draft.id]);
   const set = (patch: Partial<UpstreamProfile>) => onChange({ ...draft, ...patch });
   const preset = WINDOW_PRESETS.find((item) => item.value === draft.contextWindow);
-  const listId = `cm-models-${draft.id || "new"}`;
+  const options = draft.model && !draft.models.includes(draft.model) ? [draft.model, ...draft.models] : draft.models;
   const addModel = () => {
     const model = newModel.trim();
     if (!model) return;
@@ -439,75 +446,110 @@ function UpstreamEditor({ draft, active, dirty, busy, onChange, onSave, onActiva
     <div className="cm-editor">
       <div className="cm-editor-head">
         <input aria-label="名称" className="cm-title-input" onChange={(event) => set({ name: event.currentTarget.value })} placeholder={hostOf(draft.baseUrl) || "新上游"} value={draft.name} />
-        {draft.source !== "manual" ? <span className="cm-tag">来自 {SOURCE_LABELS[draft.source] ?? draft.source}</span> : null}
-        {active ? <span className="cm-tag" data-tone="ok"><Check />当前</span> : null}
+        {active ? <span className="cm-tag" data-tone="ok"><Check />使用中</span> : null}
       </div>
 
-      <div className="cm-form">
-        <Field hint="和 ANTHROPIC_BASE_URL 一样，写到根地址即可" label="Base URL">
-          <input autoComplete="off" onChange={(event) => set({ baseUrl: event.currentTarget.value })} placeholder="https://api.example.com" spellCheck={false} value={draft.baseUrl} />
-        </Field>
-        <Field label="Key">
-          <input autoComplete="off" onChange={(event) => set({ apiKey: event.currentTarget.value })} placeholder="sk-…" spellCheck={false} type={showKey ? "text" : "password"} value={draft.apiKey} />
-          <button aria-label={showKey ? "隐藏 Key" : "显示 Key"} className="cm-icon" onClick={() => setShowKey((value) => !value)} type="button">{showKey ? <EyeOff /> : <Eye />}</button>
-        </Field>
-        <Field hint={draft.model && draft.modelNames?.[draft.model] ? `${draft.modelNames[draft.model]}。在 Claude 里选 Opus / Sonnet 等自带条目时也用它` : "在 Claude 里选 Opus / Sonnet 等自带条目时也用它"} label="默认模型">
-          <input list={listId} onChange={(event) => set({ model: event.currentTarget.value })} placeholder="claude-opus-4-6" spellCheck={false} value={draft.model} />
-          <button className="cm-btn cm-btn-small" disabled={busy !== null || !draft.baseUrl.trim()} onClick={onFetchModels} title="从 {Base URL}/v1/models 拉取" type="button">
-            {busy === "models" ? <Loader2 className="cm-spin" /> : <RefreshCw />}拉取模型
-          </button>
-        </Field>
-        <Field hint="标题生成等小任务用；留空同默认模型" label="快速模型">
-          <input list={listId} onChange={(event) => set({ smallModel: event.currentTarget.value })} placeholder={draft.model || "同默认模型"} spellCheck={false} value={draft.smallModel} />
-        </Field>
-        <datalist id={listId}>{draft.models.map((model) => <option key={model} label={modelLabel(draft, model)} value={model} />)}</datalist>
-        <Field label="上下文窗口">
-          <select onChange={(event) => set({ contextWindow: event.currentTarget.value === "" ? null : Number(event.currentTarget.value) })} value={draft.contextWindow == null ? "" : String(draft.contextWindow)}>
-            {WINDOW_PRESETS.map((item) => <option key={item.label} value={item.value == null ? "" : String(item.value)}>{item.label}</option>)}
-            {!preset && draft.contextWindow ? <option value={String(draft.contextWindow)}>{formatWindow(draft.contextWindow)}</option> : null}
-          </select>
-        </Field>
-        <div className="cm-field">
-          <span className="cm-field-label">模型列表</span>
-          <div className="cm-chips">
-            {draft.models.map((model) => (
-              <span className="cm-chip" data-primary={model === draft.model || undefined} key={model}>
-                <button onClick={() => set({ model })} title={`${model}（点一下设为默认）`} type="button">{modelLabel(draft, model)}</button>
-                <button aria-label={`移除 ${model}`} onClick={() => set({ models: draft.models.filter((item) => item !== model), model: draft.model === model ? "" : draft.model })} type="button"><X /></button>
-              </span>
-            ))}
-            <input
-              aria-label="添加模型"
-              className="cm-chip-input"
-              onChange={(event) => setNewModel(event.currentTarget.value)}
-              onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); addModel(); } }}
-              placeholder="添加模型，回车"
-              spellCheck={false}
-              value={newModel}
-            />
+      <section className="cm-card">
+        <div className="cm-card-label">连接</div>
+        {editConnection ? (
+          <div className="cm-form">
+            <Field label="Base URL">
+              <input autoComplete="off" onChange={(event) => set({ baseUrl: event.currentTarget.value })} placeholder="https://api.example.com" spellCheck={false} value={draft.baseUrl} />
+            </Field>
+            <Field label="Key">
+              <input autoComplete="off" onChange={(event) => set({ apiKey: event.currentTarget.value })} placeholder="sk-…" spellCheck={false} type={showKey ? "text" : "password"} value={draft.apiKey} />
+              <button aria-label={showKey ? "隐藏 Key" : "显示 Key"} className="cm-icon" onClick={() => setShowKey((value) => !value)} type="button">{showKey ? <EyeOff /> : <Eye />}</button>
+            </Field>
           </div>
-          <span className="cm-field-hint">这些会出现在 Claude 的模型选择器里；点一个设为默认。</span>
-        </div>
-      </div>
+        ) : (
+          <div className="cm-card-line">
+            <span className="cm-mono cm-ellipsis" title={draft.baseUrl}>{draft.baseUrl}</span>
+            {draft.source !== "manual" ? <span className="cm-tag">来自 {SOURCE_LABELS[draft.source] ?? draft.source}</span> : null}
+            <button className="cm-link" onClick={() => setEditConnection(true)} type="button">修改</button>
+          </div>
+        )}
+      </section>
 
-      <div className="cm-editor-foot">
-        {draft.id ? <button className="cm-btn cm-btn-danger" disabled={busy !== null} onClick={onDelete} type="button"><Trash2 />删除</button> : null}
-        <span className="cm-spacer" />
-        {dirty ? <button className="cm-btn cm-btn-quiet" disabled={busy !== null} onClick={onDiscard} type="button">放弃修改</button> : null}
-        {!dirty && draft.id && !active ? <button className="cm-btn" disabled={busy !== null} onClick={onActivate} type="button">设为当前</button> : null}
-        {dirty ? <button className="cm-btn" disabled={busy !== null} onClick={() => onSave(false)} type="button">保存</button> : null}
-        {dirty ? <button className="cm-btn cm-btn-primary" disabled={busy !== null} onClick={() => onSave(true)} type="button">保存并使用</button> : null}
-      </div>
+      <section className="cm-card">
+        <div className="cm-card-label">模型</div>
+        <div className="cm-card-line">
+          {options.length ? (
+            <select aria-label="默认模型" className="cm-grow" onChange={(event) => set({ model: event.currentTarget.value })} value={draft.model}>
+              {!draft.model ? <option value="">选一个默认模型</option> : null}
+              {options.map((model) => <option key={model} value={model}>{modelLabel(draft, model)}</option>)}
+            </select>
+          ) : (
+            <input aria-label="默认模型" className="cm-grow" onChange={(event) => set({ model: event.currentTarget.value })} placeholder="先拉取模型，或直接填模型名" spellCheck={false} value={draft.model} />
+          )}
+          <button aria-label="拉取模型" className="cm-icon" disabled={busy !== null || !draft.baseUrl.trim()} onClick={onFetchModels} title="从上游拉取模型列表" type="button">
+            {busy === "models" ? <Loader2 className="cm-spin" /> : <RefreshCw />}
+          </button>
+        </div>
+        {draft.models.length > 1 ? <p className="cm-field-hint">在 Claude 里还能切换另外 {draft.models.length - 1} 个模型。</p> : null}
+      </section>
+
+      <details className="cm-more">
+        <summary>高级</summary>
+        <div className="cm-form">
+          <Field hint="标题生成等小任务用，留空同默认模型" label="快速模型">
+            <select onChange={(event) => set({ smallModel: event.currentTarget.value })} value={draft.smallModel}>
+              <option value="">同默认模型</option>
+              {options.map((model) => <option key={model} value={model}>{modelLabel(draft, model)}</option>)}
+            </select>
+          </Field>
+          <Field label="上下文窗口">
+            <select onChange={(event) => set({ contextWindow: event.currentTarget.value === "" ? null : Number(event.currentTarget.value) })} value={draft.contextWindow == null ? "" : String(draft.contextWindow)}>
+              {WINDOW_PRESETS.map((item) => <option key={item.label} value={item.value == null ? "" : String(item.value)}>{item.label}</option>)}
+              {!preset && draft.contextWindow ? <option value={String(draft.contextWindow)}>{formatWindow(draft.contextWindow)}</option> : null}
+            </select>
+          </Field>
+          <div className="cm-field">
+            <span className="cm-field-label">可选模型</span>
+            <div className="cm-chips">
+              {draft.models.map((model) => (
+                <span className="cm-chip" data-primary={model === draft.model || undefined} key={model}>
+                  <button onClick={() => set({ model })} title={`${model}（点一下设为默认）`} type="button">{modelLabel(draft, model)}</button>
+                  <button aria-label={`移除 ${model}`} onClick={() => set({ models: draft.models.filter((item) => item !== model), model: draft.model === model ? "" : draft.model })} type="button"><X /></button>
+                </span>
+              ))}
+              <input
+                aria-label="添加模型"
+                className="cm-chip-input"
+                onChange={(event) => setNewModel(event.currentTarget.value)}
+                onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); addModel(); } }}
+                placeholder="添加模型，回车"
+                spellCheck={false}
+                value={newModel}
+              />
+            </div>
+          </div>
+          {draft.id ? (
+            <div className="cm-row-actions">
+              <button className="cm-btn cm-btn-small cm-btn-danger" disabled={busy !== null} onClick={onDelete} type="button"><Trash2 />删除这组上游</button>
+            </div>
+          ) : null}
+        </div>
+      </details>
+
+      {dirty || (draft.id && !active) ? (
+        <div className="cm-editor-foot">
+          <span className="cm-spacer" />
+          {dirty ? <button className="cm-btn cm-btn-quiet" disabled={busy !== null} onClick={onDiscard} type="button">放弃修改</button> : null}
+          {!dirty && draft.id && !active ? <button className="cm-btn cm-btn-primary" disabled={busy !== null} onClick={onActivate} type="button">使用这组</button> : null}
+          {dirty ? <button className="cm-btn" disabled={busy !== null} onClick={() => onSave(false)} type="button">保存</button> : null}
+          {dirty ? <button className="cm-btn cm-btn-primary" disabled={busy !== null} onClick={() => onSave(true)} type="button">保存并使用</button> : null}
+        </div>
+      ) : null}
     </div>
   );
 }
 
-function Toggle({ label, detail, checked, disabled, onChange }: { label: string; detail?: string; checked: boolean; disabled?: boolean; onChange: (next: boolean) => void }) {
+function Toggle({ label, detail, hint, checked, disabled, onChange }: { label: string; detail?: string; hint?: string; checked: boolean; disabled?: boolean; onChange: (next: boolean) => void }) {
   return (
-    <label className="cm-toggle-row">
+    <label className="cm-toggle-row" title={detail}>
       <span className="cm-toggle-text">
         <span>{label}</span>
-        {detail ? <span className="cm-field-hint">{detail}</span> : null}
+        {hint ? <span className="cm-field-hint">{hint}</span> : null}
       </span>
       <input checked={checked} disabled={disabled} onChange={(event) => onChange(event.currentTarget.checked)} type="checkbox" />
       <span aria-hidden="true" className="cm-switch" />
@@ -586,27 +628,42 @@ function ClaudeSettings({ status, busy, onConfigure, onAction, onVoice, update, 
   );
   return (
     <div className="cm-settings">
-      <div className="cm-group">
-        <h3>功能</h3>
+      <section className="cm-card">
         <Toggle checked={config.localization} disabled={disabled} label="界面汉化" onChange={(next) => onConfigure({ localization: next })} />
-        <Toggle checked={config.computerUse} disabled={disabled} label="电脑控制" onChange={(next) => onConfigure({ computerUse: next })} />
-        <Toggle checked={config.backgroundMode} disabled={disabled} label="后台模式" onChange={(next) => onConfigure({ backgroundMode: next })} />
-        <Toggle checked={config.hideUnroutedModels ?? true} detail="Claude 自带的 Opus / Sonnet 等条目会被换成默认模型" disabled={disabled} label="只显示上游的模型" onChange={(next) => onConfigure({ hideUnroutedModels: next })} />
-      </div>
-      <div className="cm-group">
-        <h3>语音</h3>
         <Toggle
           checked={config.voiceInput}
-          detail="Claude 输入框里的麦克风，用本机 SenseVoice 转写，不上传音频。改完重新启动 Claude 生效。"
+          detail="Claude 输入框里的麦克风，用本机 SenseVoice 转写，音频不出本机。改完重新启动 Claude 生效。"
           disabled={disabled}
-          label="原生听写"
+          label="语音输入"
           onChange={onVoice}
         />
-        <VoiceModel onReady={() => onAction("prepare")} />
-        {config.voiceInput && !status.dictationReady ? <p className="cm-field-hint cm-warn-text">听写还没就绪：先下载模型，再重新启动 Claude。</p> : null}
-      </div>
-      <div className="cm-group">
-        <h3>账号显示</h3>
+        {config.voiceInput && !status.dictationReady ? <VoiceModel onReady={() => onAction("prepare")} /> : null}
+        <Toggle
+          checked={config.importCliSessions ?? true}
+          detail="启动 Claude 前，把终端、BaoCode 等命令行里建的会话加进左侧列表（已在列表里的、删过的不会重复加）。"
+          disabled={disabled}
+          label="显示命令行会话"
+          onChange={(next) => onConfigure({ importCliSessions: next })}
+        />
+      </section>
+
+      <details className="cm-more">
+        <summary>会话</summary>
+        <Toggle
+          checked={config.codeShareHome ?? true}
+          detail="开：Code 页签和命令行共用 ~/.claude（会话、MCP、插件是同一份；~/.claude/settings.json 里的接口地址会优先）。关：用独立目录，请求走这里选的上游。"
+          disabled={disabled}
+          label="和命令行共用 ~/.claude"
+          onChange={(next) => onConfigure({ codeShareHome: next })}
+        />
+        <Toggle checked={config.sessionSync === true} detail="启动前同步 3p 模式与完整功能模式的 Code 会话" disabled={disabled} label="同步 3p 模式的会话" onChange={(next) => onConfigure({ sessionSync: next })} />
+        <div className="cm-row-actions">
+          <button className="cm-btn cm-btn-small" disabled={disabled || status.claudeRunning} onClick={() => onAction("sync_sessions")} type="button">立即同步</button>
+        </div>
+      </details>
+
+      <details className="cm-more">
+        <summary>账号显示</summary>
         <p className="cm-field-hint">只改 Claude 里显示的信息，下次启动生效。</p>
         {text("displayName", "Local User", "用户名")}
         {text("email", "local@claude.local", "邮箱", "email")}
@@ -615,56 +672,31 @@ function ClaudeSettings({ status, busy, onConfigure, onAction, onVoice, update, 
             {["free", "pro", "max", "ultra"].map((plan) => <option key={plan} value={plan}>{plan[0].toUpperCase() + plan.slice(1)}</option>)}
           </select>
         </Field>
-      </div>
-      <div className="cm-group">
-        <h3>会话</h3>
-        <Toggle
-          checked={config.codeShareHome ?? true}
-          detail={config.codeShareHome ?? true
-            ? "Code 页签和命令行的 Claude Code 共用 ~/.claude：会话、MCP、插件是同一份。~/.claude/settings.json 里的接口地址（env）会优先于这里选的上游。"
-            : "Code 页签用独立目录，请求走这里选的上游；平时在命令行 / 3p 模式建的会话要靠下面的同步才能打开。"}
-          disabled={disabled}
-          label="和命令行共用 ~/.claude"
-          onChange={(next) => onConfigure({ codeShareHome: next })}
-        />
-        <Toggle
-          checked={config.importCliSessions ?? true}
-          detail="启动 Claude 前，把终端、BaoCode 等命令行里建的会话加进左侧列表（已在列表里的、删过的不会重复加）。"
-          disabled={disabled}
-          label="显示命令行会话"
-          onChange={(next) => onConfigure({ importCliSessions: next })}
-        />
-        <Toggle checked={config.sessionSync === true} detail="启动前同步 3p 模式与完整功能模式的 Code 会话" disabled={disabled} label="自动同步会话" onChange={(next) => onConfigure({ sessionSync: next })} />
-        <div className="cm-row-actions">
-          <button className="cm-btn cm-btn-small" disabled={disabled || status.claudeRunning} onClick={() => onAction("sync_sessions")} type="button">立即同步</button>
-        </div>
-      </div>
-      <div className="cm-group">
-        <h3>本地证书</h3>
-        <p className="cm-field-hint">{status.caTrusted ? "已信任。" : status.caReady ? "已准备，还没信任。" : "还没准备。"}本地服务用它接管 Claude 的请求，只在本机有效。</p>
-        <div className="cm-row-actions">
-          {!status.caReady ? <button className="cm-btn cm-btn-small" disabled={busy !== null} onClick={() => onAction("prepare")} type="button">准备证书</button> : null}
+      </details>
+
+      <details className="cm-more">
+        <summary>高级</summary>
+        <Toggle checked={config.hideUnroutedModels ?? true} detail="Claude 自带的 Opus / Sonnet 等条目会被换成默认模型" disabled={disabled} label="只显示上游的模型" onChange={(next) => onConfigure({ hideUnroutedModels: next })} />
+        <Toggle checked={config.computerUse} detail="需要系统的 Spotlight 正常工作，否则 Claude 会卡住" disabled={disabled} label="电脑控制" onChange={(next) => onConfigure({ computerUse: next })} />
+        <Toggle checked={config.backgroundMode} disabled={disabled} label="后台模式" onChange={(next) => onConfigure({ backgroundMode: next })} />
+        <div className="cm-row-actions" title="本地服务用它接管 Claude 的请求，只在本机有效。">
+          <span className="cm-field-hint cm-grow">本地证书：{status.caTrusted ? "已信任" : status.caReady ? "未信任" : "未准备"}</span>
+          {!status.caReady ? <button className="cm-btn cm-btn-small" disabled={busy !== null} onClick={() => onAction("prepare")} type="button">准备</button> : null}
           {status.caTrusted
             ? <button className="cm-btn cm-btn-small" disabled={busy !== null} onClick={() => onAction("untrust")} type="button">取消信任</button>
-            : <button className="cm-btn cm-btn-small" disabled={busy !== null} onClick={() => onAction("trust")} type="button"><ShieldCheck />信任证书</button>}
+            : <button className="cm-btn cm-btn-small" disabled={busy !== null} onClick={() => onAction("trust")} type="button"><ShieldCheck />信任</button>}
         </div>
-      </div>
-      <div className="cm-group">
-        <h3>版本与更新</h3>
-        <p className="cm-field-hint">
-          当前版本 {version || "未知"}
-          {update.phase === "latest" ? "，已是最新。" : update.phase === "available" ? `，可更新到 ${update.version}。` : update.phase === "downloading" ? `，正在更新到 ${update.version}…` : "。"}
-        </p>
-        {update.phase === "available" && update.notes ? <pre className="cm-update-notes">{update.notes}</pre> : null}
-        <div className="cm-row-actions">
-          {update.phase === "available" ? (
-            <button className="cm-btn cm-btn-small cm-btn-primary" onClick={onInstallUpdate} type="button"><Download />下载并重启</button>
-          ) : (
-            <button className="cm-btn cm-btn-small" disabled={update.phase === "checking" || update.phase === "downloading"} onClick={onCheckUpdate} type="button">
-              {update.phase === "checking" ? <Loader2 className="cm-spin" /> : <RefreshCw />}检查更新
-            </button>
-          )}
-        </div>
+      </details>
+
+      <div className="cm-about">
+        <span>ClaudeMom {version || ""}{status.version ? ` · Claude ${status.version}` : ""}</span>
+        {update.phase === "available" ? (
+          <button className="cm-link" onClick={onInstallUpdate} type="button">更新到 {update.version}</button>
+        ) : (
+          <button className="cm-link" disabled={update.phase === "checking" || update.phase === "downloading"} onClick={onCheckUpdate} type="button">
+            {update.phase === "checking" ? "检查中…" : update.phase === "latest" ? "已是最新" : "检查更新"}
+          </button>
+        )}
       </div>
     </div>
   );
