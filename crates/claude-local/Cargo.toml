@@ -9,7 +9,7 @@ repository.workspace = true
 [features]
 default = []
 # 本地听写：SenseVoice 模型下载 / 转写引擎 + 给本地兼容服务用的转写服务（ClaudeMom 打开；Codex++ 用自己的 helper）。
-dictation = ["dep:sherpa-onnx", "dep:tokio", "dep:tokio-tungstenite", "dep:futures-util", "dep:reqwest"]
+dictation = ["dep:sherpa-onnx", "dep:tokio", "dep:tokio-tungstenite", "dep:futures-util", "dep:reqwest", "dep:http"]
 
 [dependencies]
 anyhow.workspace = true
@@ -24,6 +24,7 @@ time = "0.3"
 url = "2"
 uuid.workspace = true
 futures-util = { workspace = true, optional = true }
+http = { version = "1", optional = true }
 reqwest = { workspace = true, optional = true }
 sherpa-onnx = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["io-util", "net", "sync"] }

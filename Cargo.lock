@@ -221,6 +221,7 @@ dependencies = [
  "base64 0.22.1",
  "directories",
  "futures-util",
+ "http",
  "rcgen",
  "reqwest",
  "serde",
