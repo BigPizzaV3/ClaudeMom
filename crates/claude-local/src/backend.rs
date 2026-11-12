@@ -247,7 +247,7 @@ fn source_supported(source: &Path) -> bool {
     }
 }
 
-fn private_dir(path: &Path) -> Result<()> {
+pub fn private_dir(path: &Path) -> Result<()> {
     fs::create_dir_all(path)?;
     #[cfg(unix)]
     {
@@ -1867,7 +1867,24 @@ fn launch_original(
     Ok(())
 }
 
-/// 只停止 Codex++ 自己持有的代理进程，不关闭 Claude 或其它实例。
+/// 宿主自己的启动方式（Codex++ 的 3p 模式）用：清掉会干扰 Electron / 内置 Claude Code 的继承变量，
+/// 按宿主的设置补参数和环境后，以分离进程启动原版 Claude Desktop。
+pub fn launch_claude(source: &Path, configure: impl FnOnce(&mut Command)) -> Result<()> {
+    let mut command = hidden_command(executable(source));
+    for name in [
+        "ELECTRON_RUN_AS_NODE",
+        "ELECTRON_NO_ASAR",
+        "NODE_OPTIONS",
+        "CLAUDE_USER_DATA_DIR",
+        "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+    ] {
+        command.env_remove(name);
+    }
+    configure(&mut command);
+    spawn_detached(&mut command, source, "无法启动原版 Claude Desktop")
+}
+
+/// 只停止本程序自己持有的代理进程，不关闭 Claude 或其它实例。
 pub fn stop_backend() {
     let runtime = runtime_slot()
         .lock()
@@ -3059,5 +3076,47 @@ RGvMS5OzZFvnFlekIHE6c+6QK9QtWD7P+PkIpRa1D01cb9SwsRHqGfs7o2UbaZxs\n\
         let ca_pem = fs::read(ca.join("ca.pem")).unwrap();
         prepare_ca(temp.path()).unwrap();
         assert_eq!(fs::read(ca.join("ca.pem")).unwrap(), ca_pem);
+    }
+
+    #[test]
+    fn local_settings_serialize_independently_from_enhanced_copy() {
+        let config = validate_config(ClaudeLocalSettings {
+            enabled: true,
+            model: "  relay/model  ".into(),
+            background_mode: true,
+            ..ClaudeLocalSettings::default()
+        })
+        .unwrap();
+        assert_eq!(config.model, "relay/model");
+        assert!(config.computer_use);
+        let value = serde_json::to_value(config).unwrap();
+        assert_eq!(value["voiceInput"], true);
+        assert_eq!(value["backgroundMode"], true);
+        assert!(
+            validate_config(ClaudeLocalSettings {
+                model: "model\ninjected".into(),
+                ..ClaudeLocalSettings::default()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn assets_digest_is_stable_and_part_of_the_config_hash() {
+        let digest = assets_digest();
+        assert_eq!(digest.len(), 64, "sha256 十六进制");
+        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(digest, assets_digest(), "同一份资产必须给出同一个指纹");
+
+        let config = ClaudeLocalSettings::default();
+        let hash = hash_with_desktop(&config, Value::Null, None);
+        let without_assets = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&(&config, Value::Null, Option::<(u64, u128)>::None))
+                .unwrap_or_default()
+            )
+        );
+        assert_ne!(hash, without_assets, "资产指纹要参与代理复用判断");
     }
 }

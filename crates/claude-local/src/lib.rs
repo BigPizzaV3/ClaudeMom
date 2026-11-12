@@ -19,7 +19,8 @@ pub mod dictation;
 
 pub use backend::{
     ClaudeLocalResult, ClaudeLocalStatus, configure, friendly_model_name, inherited_context_tokens,
-    perform, pick_context_tokens, reap_stale_proxy, resume_attached_proxy, status, stop_backend,
+    launch_claude, perform, pick_context_tokens, private_dir, reap_stale_proxy, resume_attached_proxy,
+    status, stop_backend,
 };
 pub use host::{Host, Upstream, install_host};
 pub use settings::ClaudeLocalSettings;
