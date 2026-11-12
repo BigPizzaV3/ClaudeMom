@@ -22,6 +22,7 @@ npm install
 npm run check && npm test          # 前端
 cargo test --workspace             # Rust（在仓库根目录）
 npx tauri build --bundles app      # 打包 macOS .app
+node scripts/relaunch-local.mjs    # 构建并重启本地实例（在仓库根目录）
 ```
 
 核心的 Node 测试：`cd crates/claude-local/runtime && node --test managed.test.mjs proxy.test.mjs`
