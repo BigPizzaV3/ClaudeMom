@@ -21,6 +21,7 @@ import {
   type UpstreamModel,
   type UpstreamProfile,
 } from "./model";
+import { checkForUpdate, currentVersion, installUpdate, type UpdateState } from "./updates";
 
 type Tab = "upstream" | "claude";
 type Notice = { text: string; tone: "ok" | "error" } | null;
@@ -39,6 +40,38 @@ export function ClaudeMomApp() {
   const pending = useRef(false);
 
   const say = (text: string, tone: "ok" | "error" = "ok") => setNotice(text ? { text, tone } : null);
+  const [version, setVersion] = useState("");
+  const [update, setUpdate] = useState<UpdateState>({ phase: "idle" });
+
+  // 启动时静默查一次更新：只在有新版本时提示，查不到（离线、限流）不打扰。
+  useEffect(() => {
+    void currentVersion().then(setVersion);
+    const timer = setTimeout(() => {
+      void checkForUpdate().then((result) => {
+        if (result.phase === "available") setUpdate(result);
+      });
+    }, 5000);
+    return () => clearTimeout(timer);
+  }, []);
+
+  const runUpdateCheck = async () => {
+    setUpdate({ phase: "checking" });
+    const result = await checkForUpdate();
+    setUpdate(result);
+    if (result.phase === "failed") say(`检查更新失败：${result.message}`, "error");
+  };
+
+  const runInstall = async () => {
+    if (update.phase !== "available") return;
+    const { update: pending, version: target } = update;
+    setUpdate({ phase: "downloading", version: target, percent: null });
+    try {
+      await installUpdate(pending, (percent) => setUpdate({ phase: "downloading", version: target, percent }));
+    } catch (cause) {
+      setUpdate({ phase: "failed", message: errorText(cause) });
+      say(`更新失败：${errorText(cause)}`, "error");
+    }
+  };
 
   const acceptBook = useCallback((result: CommandResult<UpstreamBook>, keepSelection?: string | null) => {
     const next = { profiles: result.profiles ?? [], activeId: result.activeId ?? null };
@@ -298,13 +331,28 @@ export function ClaudeMomApp() {
               </div>
             )
           ) : (
-            <ClaudeSettings busy={busy} onAction={(action) => void claudeAction(action)} onConfigure={(patch) => void configure(patch)} onVoice={(enabled) => void setVoice(enabled)} status={status} />
+            <ClaudeSettings
+              busy={busy}
+              onAction={(action) => void claudeAction(action)}
+              onConfigure={(patch) => void configure(patch)}
+              onVoice={(enabled) => void setVoice(enabled)}
+              status={status}
+              update={update}
+              version={version}
+              onCheckUpdate={() => void runUpdateCheck()}
+              onInstallUpdate={() => void runInstall()}
+            />
           )}
         </section>
 
         <footer className="cm-status">
           <span>{status?.port ? `本地服务 · 端口 ${status.port}` : "本地服务未运行"}</span>
           <span>{book.profiles.length} 组上游</span>
+          {update.phase === "available" ? (
+            <button className="cm-update-chip" onClick={() => void runInstall()} type="button">新版本 {update.version}，点此更新</button>
+          ) : update.phase === "downloading" ? (
+            <span className="cm-update-chip">正在更新到 {update.version}{update.percent != null ? ` · ${update.percent}%` : "…"}</span>
+          ) : null}
           {notice ? (
             <span className="cm-notice" data-tone={notice.tone} role={notice.tone === "error" ? "alert" : "status"}>
               {notice.text}
@@ -509,12 +557,16 @@ function VoiceModel({ onReady }: { onReady: () => void }) {
   );
 }
 
-function ClaudeSettings({ status, busy, onConfigure, onAction, onVoice }: {
+function ClaudeSettings({ status, busy, onConfigure, onAction, onVoice, update, version, onCheckUpdate, onInstallUpdate }: {
   status: ClaudeStatus | null;
   busy: string | null;
   onConfigure: (patch: Partial<ClaudeConfig>) => void;
   onAction: (action: ClaudeAction) => void;
   onVoice: (enabled: boolean) => void;
+  update: UpdateState;
+  version: string;
+  onCheckUpdate: () => void;
+  onInstallUpdate: () => void;
 }) {
   if (!status) return <div className="cm-placeholder"><Loader2 className="cm-spin" /></div>;
   const config = status.config;
@@ -566,6 +618,15 @@ function ClaudeSettings({ status, busy, onConfigure, onAction, onVoice }: {
       </div>
       <div className="cm-group">
         <h3>会话</h3>
+        <Toggle
+          checked={config.codeShareHome ?? true}
+          detail={config.codeShareHome ?? true
+            ? "Code 页签和命令行的 Claude Code 共用 ~/.claude：会话、MCP、插件是同一份。~/.claude/settings.json 里的接口地址（env）会优先于这里选的上游。"
+            : "Code 页签用独立目录，请求走这里选的上游；平时在命令行 / 3p 模式建的会话要靠下面的同步才能打开。"}
+          disabled={disabled}
+          label="和命令行共用 ~/.claude"
+          onChange={(next) => onConfigure({ codeShareHome: next })}
+        />
         <Toggle checked={config.sessionSync === true} detail="启动前同步 3p 模式与完整功能模式的 Code 会话" disabled={disabled} label="自动同步会话" onChange={(next) => onConfigure({ sessionSync: next })} />
         <div className="cm-row-actions">
           <button className="cm-btn cm-btn-small" disabled={disabled || status.claudeRunning} onClick={() => onAction("sync_sessions")} type="button">立即同步</button>
@@ -579,6 +640,23 @@ function ClaudeSettings({ status, busy, onConfigure, onAction, onVoice }: {
           {status.caTrusted
             ? <button className="cm-btn cm-btn-small" disabled={busy !== null} onClick={() => onAction("untrust")} type="button">取消信任</button>
             : <button className="cm-btn cm-btn-small" disabled={busy !== null} onClick={() => onAction("trust")} type="button"><ShieldCheck />信任证书</button>}
+        </div>
+      </div>
+      <div className="cm-group">
+        <h3>版本与更新</h3>
+        <p className="cm-field-hint">
+          当前版本 {version || "未知"}
+          {update.phase === "latest" ? "，已是最新。" : update.phase === "available" ? `，可更新到 ${update.version}。` : update.phase === "downloading" ? `，正在更新到 ${update.version}…` : "。"}
+        </p>
+        {update.phase === "available" && update.notes ? <pre className="cm-update-notes">{update.notes}</pre> : null}
+        <div className="cm-row-actions">
+          {update.phase === "available" ? (
+            <button className="cm-btn cm-btn-small cm-btn-primary" onClick={onInstallUpdate} type="button"><Download />下载并重启</button>
+          ) : (
+            <button className="cm-btn cm-btn-small" disabled={update.phase === "checking" || update.phase === "downloading"} onClick={onCheckUpdate} type="button">
+              {update.phase === "checking" ? <Loader2 className="cm-spin" /> : <RefreshCw />}检查更新
+            </button>
+          )}
         </div>
       </div>
     </div>

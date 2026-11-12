@@ -1,0 +1,119 @@
+# 推 v* tag 触发：构建 macOS（通用二进制）与 Windows 安装包，建 GitHub Release 并上传，
+# 同时生成自动更新用的 latest.json（更新包用 TAURI_SIGNING_PRIVATE_KEY 签名）。
+#
+# macOS 正式签名 + 公证：配了下面这些 Secret 就启用（与 CodexPlusPlus 同名同值），没配就是 ad-hoc 签名。
+#   MACOS_CERT_P12（base64）、MACOS_CERT_PASSWORD、MACOS_SIGNING_IDENTITY、
+#   APPLE_API_KEY_P8（base64）、APPLE_API_KEY_ID、APPLE_API_ISSUER_ID
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要补跑的 tag（如 v0.2.0）"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: --target universal-apple-darwin
+          - platform: windows-latest
+            args: ""
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: 读版本与发布说明
+        id: meta
+        shell: bash
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          version="${tag#v}"
+          app_version=$(node -p "require('./apps/claude-mom/src-tauri/tauri.conf.json').version")
+          if [ "$version" != "$app_version" ]; then
+            echo "tag $tag 与 tauri.conf.json 的版本 $app_version 不一致" >&2
+            exit 1
+          fi
+          # CHANGELOG.md 里本版本那一节原样作为 Release 说明。
+          notes=$(awk -v v="$version" '$0 ~ "^## "v" " {f=1; next} /^## / && f {exit} f' CHANGELOG.md)
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "notes<<__NOTES__"
+            echo "${notes:-ClaudeMom $version}"
+            echo "__NOTES__"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/claude-mom/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 安装前端依赖
+        working-directory: apps/claude-mom
+        run: npm ci
+
+      - name: macOS 签名身份（有 Secret 才启用）
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          if [ -n "$MACOS_CERT_P12" ] && [ -n "$MACOS_SIGNING_IDENTITY" ]; then
+            {
+              echo "APPLE_CERTIFICATE=$MACOS_CERT_P12"
+              echo "APPLE_CERTIFICATE_PASSWORD=$MACOS_CERT_PASSWORD"
+              echo "APPLE_SIGNING_IDENTITY=$MACOS_SIGNING_IDENTITY"
+            } >> "$GITHUB_ENV"
+            echo "使用正式签名：$MACOS_SIGNING_IDENTITY"
+          else
+            echo "没有签名 Secret：使用 ad-hoc 签名（首次打开需右键「打开」）"
+          fi
+          if [ -n "$APPLE_API_KEY_P8" ] && [ -n "$APPLE_API_KEY_ID" ]; then
+            key="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
+            echo "$APPLE_API_KEY_P8" | base64 --decode > "$key"
+            {
+              echo "APPLE_API_KEY=$APPLE_API_KEY_ID"
+              echo "APPLE_API_ISSUER=$APPLE_API_ISSUER_ID"
+              echo "APPLE_API_KEY_PATH=$key"
+            } >> "$GITHUB_ENV"
+            echo "启用公证"
+          fi
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: apps/claude-mom
+          tagName: ${{ steps.meta.outputs.tag }}
+          releaseName: ClaudeMom ${{ steps.meta.outputs.version }}
+          releaseBody: ${{ steps.meta.outputs.notes }}
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+          args: ${{ matrix.args }}

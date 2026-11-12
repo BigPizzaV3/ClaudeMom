@@ -46,6 +46,8 @@ export type ClaudeConfig = {
   sessionSync?: boolean;
   listAllModels?: boolean;
   hideUnroutedModels?: boolean;
+  /** Code 页签是否和命令行共用 ~/.claude。 */
+  codeShareHome?: boolean;
 };
 
 export type ClaudeStatus = {

@@ -75,6 +75,11 @@ pub trait Host: Send + Sync {
             .unwrap_or(Value::Null)
     }
 
+    /// 设置里没写时，Code 页签是否和命令行共用 `~/.claude`（见 [`ClaudeLocalSettings::code_share_home`]）。
+    fn default_code_share_home(&self) -> bool {
+        false
+    }
+
     /// 本地听写（SenseVoice）是否就绪：模型在、开关开着。
     fn dictation_ready(&self, config: &ClaudeLocalSettings) -> bool;
 

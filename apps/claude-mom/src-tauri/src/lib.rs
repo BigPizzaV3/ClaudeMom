@@ -39,6 +39,8 @@ pub fn run() {
     });
 
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             install_tray(app)?;
             if let Some(window) = app.get_webview_window(MAIN_WINDOW) {

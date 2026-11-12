@@ -77,14 +77,23 @@ impl Host for ClaudeMomHost {
 
     fn load_config(&self) -> Result<ClaudeLocalSettings> {
         let map = read_settings_map()?;
-        let mut config: ClaudeLocalSettings = map
-            .get(SETTINGS_KEY)
-            .cloned()
+        let stored = map.get(SETTINGS_KEY).cloned();
+        let mut config: ClaudeLocalSettings = stored
+            .clone()
             .map(serde_json::from_value)
             .transpose()?
             .unwrap_or_default();
         // ClaudeMom 只有完整功能模式。
         config.enabled = true;
+        // 会话同步默认开：平时在普通 Claude / 3p 模式建的会话记录在 ~/.claude，完整功能模式用独立目录，
+        // 不同步的话左侧列表里的会话全显示「在磁盘上未找到会话」。用户关掉过就尊重。
+        if stored.as_ref().and_then(|value| value.get("sessionSync")).is_none() {
+            config.session_sync = true;
+        }
+        // Code 页签默认和命令行共用 ~/.claude（填上实际生效的值，界面才显示得对）。
+        if config.code_share_home.is_none() {
+            config.code_share_home = Some(self.default_code_share_home());
+        }
         Ok(config)
     }
 
@@ -103,6 +112,10 @@ impl Host for ClaudeMomHost {
 
     fn prepare_upstream(&self, _config: &ClaudeLocalSettings) -> Result<Upstream> {
         self.active_upstream()
+    }
+
+    fn default_code_share_home(&self) -> bool {
+        true
     }
 
     fn dictation_ready(&self, config: &ClaudeLocalSettings) -> bool {

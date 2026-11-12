@@ -271,6 +271,75 @@ fn shared_full_code_dir() -> Option<PathBuf> {
         .map(|dirs| dirs.home_dir().join(".claude-desktop-local").join("claude-code"))
 }
 
+/// 这次启动 Code 页签是否和命令行共用 `~/.claude`。
+fn code_share_home(config: &ClaudeLocalSettings) -> bool {
+    config
+        .code_share_home
+        .unwrap_or_else(|| host().default_code_share_home())
+}
+
+/// 完整功能模式的会话记录在哪些配置目录里找（会话同步用）：共用时就是 `~/.claude`。
+fn full_mode_code_dirs(root: &Path, config: &ClaudeLocalSettings) -> Vec<PathBuf> {
+    let home = home_dir().join(".claude");
+    if code_share_home(config) {
+        vec![home]
+    } else {
+        vec![full_code_dir(root), home]
+    }
+}
+
+/// 给内置 Claude Code 定配置目录。
+///
+/// - 共用 `~/.claude`：**不设** `CLAUDE_CONFIG_DIR`（设了 Claude Code 会改读 `~/.claude/.claude.json`，
+///   和命令行的 `~/.claude.json` 不是一份），继承来的同名变量也去掉；独立目录里以前的会话记录补进
+///   `~/.claude/projects`（只补缺的，不覆盖）。
+/// - 独立目录：`~/.claude-desktop-local/claude-code`，并把更早各自状态目录里的记录补进来。
+fn apply_code_dir(command: &mut Command, root: &Path, share_home: bool, home_claude: &Path) -> Result<()> {
+    if share_home {
+        command.env_remove("CLAUDE_CONFIG_DIR");
+        for legacy in [full_code_dir(root), root.join("claude-code")] {
+            merge_projects(&legacy, home_claude);
+        }
+    } else {
+        let code_dir = full_code_dir(root);
+        private_dir(&code_dir)?;
+        merge_legacy_full_code_dir(&root.join("claude-code"), &code_dir);
+        command.env("CLAUDE_CONFIG_DIR", &code_dir);
+    }
+    Ok(())
+}
+
+/// 把一个配置目录 `projects/` 下的会话记录补进另一个（只补缺的文件，已有目录的权限不动）。
+fn merge_projects(from_config: &Path, to_config: &Path) {
+    let from = from_config.join("projects");
+    if from_config == to_config || !from.is_dir() {
+        return;
+    }
+    if let Err(error) = copy_missing_keep_existing(&from, &to_config.join("projects")) {
+        let _ = crate::host::diagnostic(
+            "claude_local.merge_projects_failed",
+            serde_json::json!({ "message": format!("{error:#}") }),
+        );
+    }
+}
+
+fn copy_missing_keep_existing(from: &Path, to: &Path) -> Result<()> {
+    if !to.exists() {
+        fs::create_dir_all(to)?;
+    }
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let target = to.join(entry.file_name());
+        if kind.is_dir() {
+            copy_missing_keep_existing(&entry.path(), &target)?;
+        } else if kind.is_file() && !target.exists() {
+            fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
 /// 共享目录之前，会话记录在各自状态目录的 `claude-code/` 里：启动前把缺的文件补进共享目录。
 /// 只复制共享目录里还没有的文件，不覆盖、不删除原文件；复制失败只记日志，不挡启动。
 fn merge_legacy_full_code_dir(legacy: &Path, shared: &Path) {
@@ -1307,7 +1376,7 @@ pub fn resume_attached_proxy() -> Result<Option<u16>> {
     // 程序升级后恢复的代理也要用新版脚本，不能沿用状态目录里的旧副本。
     install_assets(&root)?;
     let upstream = host().prepare_upstream(&config)?;
-    sync_model_compact_windows(&root, &upstream);
+    sync_model_compact_windows(&root, &config, &upstream);
     start_backend(&root, &node, &config, &upstream, Some(port)).map(Some)
 }
 
@@ -1733,7 +1802,11 @@ fn write_model_compact_windows(code_dir: &Path, windows: &BTreeMap<String, u64>)
 }
 
 /// 按当前网关声明同步一次逐模型窗口；失败不影响启动。
-fn sync_model_compact_windows(root: &Path, upstream: &Upstream) {
+fn sync_model_compact_windows(root: &Path, config: &ClaudeLocalSettings, upstream: &Upstream) {
+    // 共用 ~/.claude 时不往用户自己的 settings.json 里写东西。
+    if code_share_home(config) {
+        return;
+    }
     let _ = write_model_compact_windows(&full_code_dir(root), &upstream.model_windows);
 }
 
@@ -1830,6 +1903,7 @@ fn launch_original(
     port: Option<u16>,
     localization: bool,
     upstream: Option<&Upstream>,
+    share_home: bool,
 ) -> Result<()> {
     let mut command = hidden_command(executable(source));
     for name in [
@@ -1848,12 +1922,9 @@ fn launch_original(
         }
         // 完整功能模式直接用真实 Claude profile（无 --user-data-dir），启动前切到 1p 并记录回滚信息。
         apply_real_profile_one_p(&profile_sets(), root)?;
-        let code_dir = full_code_dir(root);
-        private_dir(&code_dir)?;
-        merge_legacy_full_code_dir(&root.join("claude-code"), &code_dir);
+        apply_code_dir(&mut command, root, share_home, &home_dir().join(".claude"))?;
         command
             .args(local_launch_args(root, port, localization))
-            .env("CLAUDE_CONFIG_DIR", &code_dir)
             .env("ANTHROPIC_BASE_URL", format!("http://127.0.0.1:{port}"))
             .env("ANTHROPIC_API_KEY", &upstream.token)
             .env("ANTHROPIC_AUTH_TOKEN", &upstream.token)
@@ -2104,7 +2175,7 @@ pub fn perform(action: &str) -> Result<ClaudeLocalResult> {
                 &main.three_p.join("claude-code-sessions"),
                 &[root.join("claude-code-3p"), home_dir().join(".claude")],
                 &main.data.join("claude-code-sessions"),
-                &[full_code_dir(&root), home_dir().join(".claude")],
+                &full_mode_code_dirs(&root, &config),
                 &root.join("backups/session-sync"),
             )?;
             if !report.note.is_empty() {
@@ -2132,7 +2203,7 @@ pub fn perform(action: &str) -> Result<ClaudeLocalResult> {
                     &main.three_p.join("claude-code-sessions"),
                     &[root.join("claude-code-3p"), home_dir().join(".claude")],
                     &main.data.join("claude-code-sessions"),
-                    &[full_code_dir(&root), home_dir().join(".claude")],
+                    &full_mode_code_dirs(&root, &config),
                     &root.join("backups/session-sync"),
                 ) {
                     Ok(report) if report.to_full + report.to_three_p + report.updated > 0 => {
@@ -2162,10 +2233,10 @@ pub fn perform(action: &str) -> Result<ClaudeLocalResult> {
                     prepare_dictation(&root, &node)?;
                 }
                 let upstream = host().prepare_upstream(&config)?;
-                sync_model_compact_windows(&root, &upstream);
+                sync_model_compact_windows(&root, &config, &upstream);
                 let port = start_backend(&root, &node, &config, &upstream, None)?;
                 if let Err(error) =
-                    launch_original(&source, &root, Some(port), config.localization, Some(&upstream))
+                    launch_original(&source, &root, Some(port), config.localization, Some(&upstream), code_share_home(&config))
                 {
                     stop_backend();
                     return Err(error);
@@ -2221,6 +2292,51 @@ mod tests {
         assert_eq!(before, hash_with_desktop(&config, Value::Null, Some((100, 1))));
         assert_ne!(before, hash_with_desktop(&config, Value::Null, Some((100, 2))), "修改时间变了");
         assert_ne!(before, hash_with_desktop(&config, Value::Null, Some((101, 1))), "大小变了");
+    }
+
+    /// 共用 ~/.claude：不设 CLAUDE_CONFIG_DIR（还要删掉继承的），旧的会话记录只补 projects/ 里缺的。
+    #[test]
+    fn sharing_home_drops_config_dir_and_merges_only_missing_transcripts() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("state/claude-local");
+        let legacy = root.join("claude-code");
+        fs::create_dir_all(legacy.join("projects/p1")).unwrap();
+        fs::write(legacy.join("projects/p1/old.jsonl"), "from-full-mode").unwrap();
+        fs::write(legacy.join("projects/p1/both.jsonl"), "full-copy").unwrap();
+        fs::write(legacy.join("settings.json"), "{}").unwrap();
+        let home = temp.path().join("home/.claude");
+        fs::create_dir_all(home.join("projects/p1")).unwrap();
+        fs::write(home.join("projects/p1/both.jsonl"), "cli-copy").unwrap();
+
+        let mut command = Command::new("claude");
+        command.env("CLAUDE_CONFIG_DIR", "/inherited");
+        apply_code_dir(&mut command, &root, true, &home).unwrap();
+        let config_dir: Vec<_> = command
+            .get_envs()
+            .filter(|(key, _)| key.to_string_lossy() == "CLAUDE_CONFIG_DIR")
+            .collect();
+        assert_eq!(config_dir.len(), 1);
+        assert!(config_dir[0].1.is_none(), "共用时要删掉 CLAUDE_CONFIG_DIR");
+        assert_eq!(fs::read_to_string(home.join("projects/p1/old.jsonl")).unwrap(), "from-full-mode");
+        assert_eq!(fs::read_to_string(home.join("projects/p1/both.jsonl")).unwrap(), "cli-copy", "不覆盖命令行的");
+        assert!(!home.join("settings.json").exists(), "只动 projects/，不碰用户的 settings.json");
+
+        let mut isolated = Command::new("claude");
+        apply_code_dir(&mut isolated, &root, false, &home).unwrap();
+        let value = isolated
+            .get_envs()
+            .find(|(key, _)| key.to_string_lossy() == "CLAUDE_CONFIG_DIR")
+            .and_then(|(_, value)| value.map(|value| value.to_owned()));
+        assert_eq!(value, Some(full_code_dir(&root).into_os_string()), "独立模式照旧");
+    }
+
+    #[test]
+    fn code_share_home_is_optional_in_stored_settings() {
+        let old: ClaudeLocalSettings = serde_json::from_value(json!({"enabled": true})).unwrap();
+        assert_eq!(old.code_share_home, None, "老配置没有这一项，按宿主默认");
+        assert!(serde_json::to_value(&old).unwrap().get("codeShareHome").is_none());
+        let on: ClaudeLocalSettings = serde_json::from_value(json!({"codeShareHome": true})).unwrap();
+        assert_eq!(on.code_share_home, Some(true));
     }
 
     /// 共享会话目录：旧位置的会话记录补进共享目录，已有的文件不覆盖，原文件保留。

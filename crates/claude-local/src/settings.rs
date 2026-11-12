@@ -24,6 +24,11 @@ pub struct ClaudeLocalSettings {
     /// 隐藏 Claude 自带、供应商池里没有对应路由的模型（Opus / Sonnet / Haiku 等原生条目，默认开）。
     /// 这些条目选了也会被换成默认模型；关掉则照旧显示。
     pub hide_unrouted_models: bool,
+    /// Code 页签（内置 Claude Code）是否和命令行共用 `~/.claude`：会话记录、MCP、插件都是同一份。
+    /// 代价是 `~/.claude/settings.json` 里的 `env`（如 `ANTHROPIC_BASE_URL`）会盖过本程序给的上游。
+    /// 不写时按宿主的默认（ClaudeMom 共用，Codex++ 独立）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_share_home: Option<bool>,
 }
 
 impl Default for ClaudeLocalSettings {
@@ -41,6 +46,7 @@ impl Default for ClaudeLocalSettings {
             session_sync: false,
             list_all_models: false,
             hide_unrouted_models: true,
+            code_share_home: None,
         }
     }
 }

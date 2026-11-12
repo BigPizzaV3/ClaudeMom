@@ -7,7 +7,7 @@
 // 启动时剥掉会话里的 CLAUDE_CODE_* / ANTHROPIC_* / 代理变量：open 会把调用方的环境带给应用，
 // 漏进去会让内置 Claude Code 绕过本地服务直连官方（401）。
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -22,9 +22,20 @@ const run = (command, args, options = {}) => {
 };
 
 if (!skipBuild) {
-  run("npx", ["tauri", "build", "--bundles", "app"], {
+  // 自动更新包要用更新签名私钥：本机有（~/.tauri/claude-mom-updater.key）就用，没有就不出更新包。
+  const keyFile = path.join(process.env.HOME ?? "", ".tauri", "claude-mom-updater.key");
+  const passwordFile = `${keyFile.replace(/\.key$/, "")}.password`;
+  const signing = existsSync(keyFile)
+    ? {
+        TAURI_SIGNING_PRIVATE_KEY: readFileSync(keyFile, "utf8"),
+        TAURI_SIGNING_PRIVATE_KEY_PASSWORD: existsSync(passwordFile) ? readFileSync(passwordFile, "utf8").trim() : "",
+      }
+    : null;
+  const args = ["tauri", "build", "--bundles", "app"];
+  if (!signing) args.push("--config", JSON.stringify({ bundle: { createUpdaterArtifacts: false } }));
+  run("npx", args, {
     cwd: appDir,
-    env: { ...process.env, PATH: `${process.env.HOME}/.cargo/bin:${process.env.PATH}` },
+    env: { ...process.env, ...(signing ?? {}), PATH: `${process.env.HOME}/.cargo/bin:${process.env.PATH}` },
   });
 }
 if (!existsSync(bundle)) {
