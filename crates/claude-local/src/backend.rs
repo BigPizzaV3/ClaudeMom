@@ -1836,7 +1836,45 @@ fn clone_command_to(command: &Command, program: &Path) -> Command {
 /// Windows 的 MSIX 包内路径直接 spawn 可能因重解析点权限失败：若 source 是 MSIX
 /// 路径且 `%LOCALAPPDATA%\Microsoft\WindowsApps\claude-desktop.exe` 别名存在，
 /// 用别名原样重试一次（不用包激活，环境变量才能传进去）。
+/// macOS：经 LaunchServices（`/usr/bin/open -n <Claude.app> --args …`）启动，而不是直接 exec 可执行文件。
+///
+/// 直接作为本程序的子进程启动时，系统把 Claude 的隐私权限（辅助功能、屏幕录制）记在「负责进程」
+/// ——也就是 ClaudeMom / Codex++ 名下：Claude 设置里永远显示「未请求」，电脑控制拿不到权限。
+/// `open` 启动的 Claude 父进程是 launchd，权限按 Claude 自己算。`open` 会把自身的环境变量原样转给 Claude，
+/// 所以原命令上的增删（代理变量、CLAUDE_CONFIG_DIR 等）照样生效；参数放在 `--args` 后面。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn via_launch_services(command: &Command, app: &Path) -> Command {
+    let mut open = Command::new("/usr/bin/open");
+    open.arg("-n").arg(app).arg("--args").args(command.get_args());
+    for (key, value) in command.get_envs() {
+        match value {
+            Some(value) => {
+                open.env(key, value);
+            }
+            None => {
+                open.env_remove(key);
+            }
+        }
+    }
+    open
+}
+
 fn spawn_detached(command: &mut Command, source: &Path, failure: &'static str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    if source.extension().is_some_and(|extension| extension == "app") && source.is_dir() {
+        let output = via_launch_services(command, source)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .context(failure)?;
+        ensure!(
+            output.status.success(),
+            "{failure}：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return Ok(());
+    }
     let _ = source;
     command
         .stdin(Stdio::null())
@@ -2312,6 +2350,29 @@ mod tests {
         assert_eq!(before, hash_with_desktop(&config, Value::Null, Some((100, 1))));
         assert_ne!(before, hash_with_desktop(&config, Value::Null, Some((100, 2))), "修改时间变了");
         assert_ne!(before, hash_with_desktop(&config, Value::Null, Some((101, 1))), "大小变了");
+    }
+
+    /// macOS 经 open 启动：参数原样放在 --args 后，环境变量的增删照搬（open 会转给 Claude）。
+    #[test]
+    fn launch_services_command_keeps_args_and_env_changes() {
+        let mut command = Command::new("/Applications/Claude.app/Contents/MacOS/Claude");
+        command
+            .args(["--proxy-server=http://127.0.0.1:4321", "--lang=zh-CN"])
+            .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:4321")
+            .env_remove("HTTPS_PROXY");
+        let open = via_launch_services(&command, Path::new("/Applications/Claude.app"));
+        assert_eq!(open.get_program(), "/usr/bin/open");
+        let args: Vec<_> = open.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            args,
+            ["-n", "/Applications/Claude.app", "--args", "--proxy-server=http://127.0.0.1:4321", "--lang=zh-CN"]
+        );
+        let envs: Vec<_> = open
+            .get_envs()
+            .map(|(key, value)| (key.to_string_lossy().into_owned(), value.map(|value| value.to_string_lossy().into_owned())))
+            .collect();
+        assert!(envs.contains(&("ANTHROPIC_BASE_URL".into(), Some("http://127.0.0.1:4321".into()))));
+        assert!(envs.contains(&("HTTPS_PROXY".into(), None)), "删掉的变量也要在 open 上删掉");
     }
 
     /// 共用 ~/.claude：不设 CLAUDE_CONFIG_DIR（还要删掉继承的），旧的会话记录只补 projects/ 里缺的。
