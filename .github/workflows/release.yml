@@ -92,7 +92,7 @@ jobs:
           else
             echo "没有签名 Secret：使用 ad-hoc 签名（首次打开需右键「打开」）"
           fi
-          if [ -n "$APPLE_API_KEY_P8" ] && [ -n "$APPLE_API_KEY_ID" ]; then
+          if [ -n "$APPLE_API_KEY_P8" ] && [ -n "$APPLE_API_KEY_ID" ] && [ -n "$APPLE_API_ISSUER_ID" ]; then
             key="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
             echo "$APPLE_API_KEY_P8" | base64 --decode > "$key"
             {
@@ -101,6 +101,8 @@ jobs:
               echo "APPLE_API_KEY_PATH=$key"
             } >> "$GITHUB_ENV"
             echo "启用公证"
+          else
+            echo "公证 Secret 不全（APPLE_API_KEY_P8 / APPLE_API_KEY_ID / APPLE_API_ISSUER_ID）：只签名不公证"
           fi
 
       - uses: tauri-apps/tauri-action@v0
