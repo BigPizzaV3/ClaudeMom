@@ -101,7 +101,7 @@ pub fn source_app(deadline: Instant) -> Result<PathBuf> {
     Ok(local.join(r"Programs\Claude\Claude.exe"))
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn claude_package_locations(bytes: &[u8]) -> Result<Vec<String>> {
     // PowerShell 对零、一、多条记录分别输出空白、对象、数组。
     if bytes.iter().all(u8::is_ascii_whitespace) {
@@ -194,3 +194,26 @@ pub fn app_version(app: &Path, _key: &str, deadline: Instant) -> Result<String> 
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn app_version(_app: &Path, _key: &str, _deadline: Instant) -> Result<String> { Ok(String::new()) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_msix_namespace_discovery_and_classification_agree() {
+        let packages = br#"[{"Name":"AnthropicPBC.Claude","InstallLocation":"C:\\Program Files\\WindowsApps\\AnthropicPBC.Claude_2.42304.0.0_x64__fnn82j28hfe8t"},{"Name":"ClaudeFork","InstallLocation":"C:\\Other"}]"#;
+        let locations = claude_package_locations(packages).unwrap();
+        assert_eq!(locations.len(), 1);
+        assert!(is_claude_msix_path(Path::new(&format!(
+            "{}\\app\\Claude.exe",
+            locations[0]
+        ))));
+        assert_eq!(
+            claude_package_locations(br#"{"Name":"Claude","InstallLocation":"C:\\legacy"}"#)
+                .unwrap(),
+            vec![r"C:\legacy"]
+        );
+        assert!(claude_package_locations(b"").unwrap().is_empty());
+        assert!(claude_package_locations(b"not JSON").is_err());
+    }
+}
