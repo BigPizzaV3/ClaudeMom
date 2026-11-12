@@ -4,6 +4,7 @@
 //! 进程启动时 [`install_host`] 一次，然后调用 [`status`] / [`configure`] / [`perform`] 等。
 
 mod backend;
+pub mod cli_import;
 pub mod desktop;
 pub mod fsutil;
 mod host;

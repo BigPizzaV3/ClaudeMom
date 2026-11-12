@@ -627,6 +627,13 @@ function ClaudeSettings({ status, busy, onConfigure, onAction, onVoice, update, 
           label="和命令行共用 ~/.claude"
           onChange={(next) => onConfigure({ codeShareHome: next })}
         />
+        <Toggle
+          checked={config.importCliSessions ?? true}
+          detail="启动 Claude 前，把终端、BaoCode 等命令行里建的会话加进左侧列表（已在列表里的、删过的不会重复加）。"
+          disabled={disabled}
+          label="显示命令行会话"
+          onChange={(next) => onConfigure({ importCliSessions: next })}
+        />
         <Toggle checked={config.sessionSync === true} detail="启动前同步 3p 模式与完整功能模式的 Code 会话" disabled={disabled} label="自动同步会话" onChange={(next) => onConfigure({ sessionSync: next })} />
         <div className="cm-row-actions">
           <button className="cm-btn cm-btn-small" disabled={disabled || status.claudeRunning} onClick={() => onAction("sync_sessions")} type="button">立即同步</button>

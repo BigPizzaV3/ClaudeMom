@@ -2221,6 +2221,26 @@ pub fn perform(action: &str) -> Result<ClaudeLocalResult> {
                     }
                 }
             }
+            // 命令行建的会话登记进 Desktop 列表：从 Code 页签实际用的目录里找（共用时就是 ~/.claude）。
+            if config.enabled && config.import_cli_sessions {
+                let code_dir = if code_share_home(&config) { home_dir().join(".claude") } else { full_code_dir(&root) };
+                let sets = profile_sets();
+                if let Some(main) = sets.first() {
+                    let sessions = crate::cli_import::full_mode_sessions_dir(&main.data);
+                    match crate::cli_import::import_cli_sessions(&code_dir, &sessions) {
+                        Ok(report) if report.imported > 0 => {
+                            sync_summary.push_str(&format!("已把 {} 个命令行会话加进会话列表。", report.imported));
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            let _ = crate::host::diagnostic(
+                                "claude_local.import_cli_sessions_failed",
+                                serde_json::json!({"error": format!("{error:#}")}),
+                            );
+                        }
+                    }
+                }
+            }
             if config.enabled {
                 install_assets(&root)?;
                 prepare_ca(&root)?;

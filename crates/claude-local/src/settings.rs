@@ -29,6 +29,8 @@ pub struct ClaudeLocalSettings {
     /// 不写时按宿主的默认（ClaudeMom 共用，Codex++ 独立）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code_share_home: Option<bool>,
+    /// 启动前把命令行（终端、BaoCode 等）建的 Claude Code 会话登记进 Desktop 的会话列表（默认开）。
+    pub import_cli_sessions: bool,
 }
 
 impl Default for ClaudeLocalSettings {
@@ -47,6 +49,7 @@ impl Default for ClaudeLocalSettings {
             list_all_models: false,
             hide_unrouted_models: true,
             code_share_home: None,
+            import_cli_sessions: true,
         }
     }
 }

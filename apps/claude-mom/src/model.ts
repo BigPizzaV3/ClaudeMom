@@ -48,6 +48,8 @@ export type ClaudeConfig = {
   hideUnroutedModels?: boolean;
   /** Code 页签是否和命令行共用 ~/.claude。 */
   codeShareHome?: boolean;
+  /** 启动前把命令行建的会话加进 Desktop 的会话列表。 */
+  importCliSessions?: boolean;
 };
 
 export type ClaudeStatus = {
