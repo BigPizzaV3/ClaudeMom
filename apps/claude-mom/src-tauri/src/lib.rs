@@ -128,6 +128,12 @@ fn install_tray<R: tauri::Runtime>(app: &tauri::App<R>) -> tauri::Result<()> {
                 show_main_window(tray.app_handle());
             }
         });
+    // macOS 菜单栏用单色模板图标（系统按深浅色着色）；其它平台用彩色应用图标。
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.icon(tauri::include_image!("icons/tray@2x.png")).icon_as_template(true);
+    }
+    #[cfg(not(target_os = "macos"))]
     if let Some(icon) = app.default_window_icon().cloned() {
         builder = builder.icon(icon);
     }
