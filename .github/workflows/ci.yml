@@ -1,0 +1,49 @@
+# 每次推送 main：macOS / Windows 上跑测试并完整编一遍（不打包、不发布），发版前先把平台问题暴露出来。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/claude-mom/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 前端：类型检查、测试、构建
+        working-directory: apps/claude-mom
+        run: |
+          npm ci
+          npm run check
+          npm test
+          npm run vite:build
+
+      - name: Rust 测试
+        run: cargo test --workspace
+
+      - name: 本地兼容服务（Node）测试
+        if: matrix.platform == 'macos-latest'
+        working-directory: crates/claude-local/runtime
+        run: |
+          bash scripts/gen-ca.sh
+          node --test --test-timeout=120000 managed.test.mjs proxy.test.mjs scripts/*.test.mjs
+
+      - name: release 编译
+        run: cargo build --release -p claude-mom
