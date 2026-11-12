@@ -23,7 +23,7 @@ Claude 安装包。代理、证书、缓存和会话数据由 Codex++ 放在独�
 | `CLAUDE_LOCAL_CACHE_DIR` | 本地代理缓存，听写补丁也写入此目录 |
 | `CLAUDE_LOCAL_STATE_FILE` | 会话和通知设置文件；原子写入、权限为 `0600` |
 | `CLAUDE_LOCAL_READY_FILE` / `_INSTANCE_ID` | 本次启动的就绪回执和实例标识 |
-| `CLAUDE_LOCAL_LOCALIZATION` / `_VOICE_INPUT` / `_COMPUTER_USE` / `_BACKGROUND_MODE` | 各能力的独立开关，`0` 关闭、`1` 开启 |
+| `CLAUDE_LOCAL_LOCALIZATION` / `_VOICE_INPUT` / `_COMPUTER_USE` / `_BACKGROUND_MODE` / `_FORCE_BACKGROUND_MODE` | 各能力的独立开关，`0` 关闭、`1` 开启；最后一个无视后台模式的 macOS 版本上限 |
 
 受管启动支持 `--port 0`，监听后写入
 `{instanceId,pid,port,mode,lastClientAt}` 回执，不包含网关凭据。

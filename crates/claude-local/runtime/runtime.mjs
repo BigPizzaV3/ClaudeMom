@@ -108,6 +108,9 @@ export function runtimeConfig(env = process.env) {
     voiceInput: flag("VOICE_INPUT"),
     computerUse: flag("COMPUTER_USE"),
     backgroundMode: flag("BACKGROUND_MODE"),
+    // 无视 Claude 对后台模式的 macOS 版本上限（见 proxy.mjs 的 /api/desktop/features）。
+    // 只认显式的 1：没设置时保持 Claude 自己的限制。
+    forceBackgroundMode: env.CLAUDE_LOCAL_FORCE_BACKGROUND_MODE === "1",
     // 录制 bootstrap 里自带的原生模型（Opus / Sonnet / Haiku …）不对应任何供应商，
     // 选了也会被 gatewayModel 换成默认模型；默认从选择器里拿掉，只留供应商池里的。
     hideUnroutedModels: flag("HIDE_UNROUTED_MODELS"),

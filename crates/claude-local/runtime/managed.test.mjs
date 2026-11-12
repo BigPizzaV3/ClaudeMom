@@ -563,9 +563,14 @@ test("RPC sends preserve model choice, switching, complete history and restart s
 test("managed SIGTERM and stdin closure flush state and release the listener", async () => {
   await stop(service, true);
   await assert.rejects(request(service, "/__codex_claude_local/health"));
-  service = await start({ CLAUDE_LOCAL_COMPUTER_USE: "1", CLAUDE_LOCAL_BACKGROUND_MODE: "0", CLAUDE_LOCAL_LOCALIZATION: "0" });
+  service = await start({
+    CLAUDE_LOCAL_COMPUTER_USE: "1", CLAUDE_LOCAL_BACKGROUND_MODE: "0", CLAUDE_LOCAL_FORCE_BACKGROUND_MODE: "1",
+    CLAUDE_LOCAL_LOCALIZATION: "0",
+  });
   const flags = await request(service, "/api/desktop/features", { host: "claude.ai" });
   assert.deepEqual(flags.json.features["1291166712"].value, { enabled: true, appScopedEnabled: false });
+  // 强制后台模式：把 macOS 版本上限抬高，新系统上不再判为「暂不支持」。
+  assert.deepEqual(flags.json.features["1346958739"].value, { major: 99, minor: 9999 });
   const bootstrap = await request(service, "/edge-api/bootstrap", { host: "claude.ai" });
   assert.equal(bootstrap.json.locale, "en-US");
   const shell = await request(service, "/new", { host: "claude.ai" });

@@ -844,13 +844,22 @@ function mockApi(req, res, url) {
   }
   // 原生桌面使用已求值的 GrowthBook 结果；用户开关和系统权限仍由客户端检查。
   if (method === "GET" && p === "/api/desktop/features") {
-    return json(res, { features: {
+    const features = {
       "1291166712": {
         value: { enabled: runtime.computerUse, appScopedEnabled: runtime.computerUse && runtime.backgroundMode },
         on: runtime.computerUse, off: !runtime.computerUse, source: "force",
         experiment: null, experimentResult: null,
       },
-    } });
+    };
+    // 后台模式的 macOS 版本上限（Claude 内置默认 26.x，系统更新就提示「暂不支持」）。
+    // 强制开启时把上限抬到 99，新系统也放行。
+    if (runtime.forceBackgroundMode) {
+      features["1346958739"] = {
+        value: { major: 99, minor: 9999 }, on: true, off: false, source: "force",
+        experiment: null, experimentResult: null,
+      };
+    }
+    return json(res, { features });
   }
 
   // 账户页会直接读取 reasons.length；本地后端不开放账号删除。

@@ -9,6 +9,9 @@ pub struct ClaudeLocalSettings {
     pub voice_input: bool,
     pub computer_use: bool,
     pub background_mode: bool,
+    /// 无视 Claude 对后台模式的 macOS 版本上限（新系统上 Claude 会提示「暂不支持」，默认关）。
+    /// 打开时一并打开后台模式；Claude 没在这个系统上验证过，可能不稳定。
+    pub force_background_mode: bool,
     /// Claude 里显示的用户名；空串按「Local User」。
     pub display_name: String,
     /// Claude 里显示的邮箱；空串按「local@claude.local」。
@@ -42,6 +45,7 @@ impl Default for ClaudeLocalSettings {
             voice_input: true,
             computer_use: false,
             background_mode: false,
+            force_background_mode: false,
             display_name: String::new(),
             email: String::new(),
             plan: "ultra".into(),

@@ -1331,6 +1331,9 @@ fn validate_config(mut config: ClaudeLocalSettings) -> Result<ClaudeLocalSetting
         config.model.len() <= 512 && !config.model.chars().any(char::is_control),
         "模型名称包含无效字符或过长"
     );
+    if config.force_background_mode {
+        config.background_mode = true;
+    }
     if config.background_mode {
         config.computer_use = true;
     }
@@ -1693,6 +1696,7 @@ fn start_backend(
         .env("CLAUDE_LOCAL_VOICE_INPUT", flag(config.voice_input))
         .env("CLAUDE_LOCAL_COMPUTER_USE", flag(config.computer_use))
         .env("CLAUDE_LOCAL_BACKGROUND_MODE", flag(config.background_mode))
+        .env("CLAUDE_LOCAL_FORCE_BACKGROUND_MODE", flag(config.force_background_mode))
         .env("CLAUDE_LOCAL_HIDE_UNROUTED_MODELS", flag(config.hide_unrouted_models))
         .env("CLAUDE_LOCAL_DISPLAY_NAME", config.effective_display_name())
         .env("CLAUDE_LOCAL_EMAIL", config.effective_email())
@@ -3289,6 +3293,14 @@ RGvMS5OzZFvnFlekIHE6c+6QK9QtWD7P+PkIpRa1D01cb9SwsRHqGfs7o2UbaZxs\n\
         let value = serde_json::to_value(config).unwrap();
         assert_eq!(value["voiceInput"], true);
         assert_eq!(value["backgroundMode"], true);
+        assert_eq!(value["forceBackgroundMode"], false);
+        // 强制后台模式会连带打开后台模式和电脑控制。
+        let forced = validate_config(ClaudeLocalSettings {
+            force_background_mode: true,
+            ..ClaudeLocalSettings::default()
+        })
+        .unwrap();
+        assert!(forced.background_mode && forced.computer_use);
         assert!(
             validate_config(ClaudeLocalSettings {
                 model: "model\ninjected".into(),

@@ -678,7 +678,8 @@ function ClaudeSettings({ status, busy, onConfigure, onAction, onVoice, update, 
         <summary>高级</summary>
         <Toggle checked={config.hideUnroutedModels ?? true} detail="Claude 自带的 Opus / Sonnet 等条目会被换成默认模型" disabled={disabled} label="只显示上游的模型" onChange={(next) => onConfigure({ hideUnroutedModels: next })} />
         <Toggle checked={config.computerUse} detail="需要系统的 Spotlight 正常工作，否则 Claude 会卡住" disabled={disabled} label="电脑控制" onChange={(next) => onConfigure({ computerUse: next })} />
-        <Toggle checked={config.backgroundMode} disabled={disabled} label="后台模式" onChange={(next) => onConfigure({ backgroundMode: next })} />
+        <Toggle checked={config.backgroundMode} disabled={disabled} label="后台模式" onChange={(next) => onConfigure(next ? { backgroundMode: true } : { backgroundMode: false, forceBackgroundMode: false })} />
+        <Toggle checked={config.forceBackgroundMode ?? false} detail="Claude 在较新的 macOS 上会提示「暂不支持后台模式」；打开后不再限制系统版本，未经 Claude 验证，可能不稳定" disabled={disabled} label="新系统也开后台模式" onChange={(next) => onConfigure({ forceBackgroundMode: next })} />
         <div className="cm-row-actions" title="本地服务用它接管 Claude 的请求，只在本机有效。">
           <span className="cm-field-hint cm-grow">本地证书：{status.caTrusted ? "已信任" : status.caReady ? "未信任" : "未准备"}</span>
           {!status.caReady ? <button className="cm-btn cm-btn-small" disabled={busy !== null} onClick={() => onAction("prepare")} type="button">准备</button> : null}

@@ -522,6 +522,11 @@ test("Desktop exposes the separate background-mode capability without selecting 
   assert.equal(result.body.chicagoPreferredMode, undefined);
 });
 
+test("Desktop keeps its own macOS ceiling for background mode unless forced", async () => {
+  const result = await request("/api/desktop/features", { host: "claude.ai" });
+  assert.equal(result.body.features["1346958739"], undefined);
+});
+
 test("account settings receive deletion eligibility and trusted-device lists", async () => {
   const eligibility = await request("/api/account/deletion-allowed", { host: "claude.ai" });
   assert.equal(eligibility.status, 200);
