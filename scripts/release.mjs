@@ -47,7 +47,8 @@ if (dryRun) process.exit(0);
 // 同步 Cargo.lock 里本仓库包的版本号。
 execFileSync("cargo", ["update", "--workspace", "--offline"], { cwd: root, stdio: "inherit" });
 git("add", "Cargo.toml", "Cargo.lock", "apps/claude-mom/src-tauri/tauri.conf.json", "apps/claude-mom/package.json");
-git("commit", "-m", `release: v${version}`);
+// 版本号本来就是这一版（例如首个版本）时没有改动，直接在当前提交上打 tag。
+if (git("diff", "--cached", "--name-only")) git("commit", "-m", `release: v${version}`);
 git("tag", `v${version}`);
 execFileSync("git", ["push", "--atomic", "origin", "HEAD", `v${version}`], { cwd: root, stdio: "inherit" });
 console.log(`已推送 v${version}，GitHub Actions 开始构建：https://github.com/BigPizzaV3/ClaudeMom/actions`);
