@@ -7,6 +7,8 @@
 - **不改原版应用**：本地兼容服务 + 本机证书接管 Claude Desktop 的请求，官方 App 与登录态都不动。
 - **本地听写**：SenseVoice 离线转写，音频不出本机。
 
+友情链接：<a href="https://linux.do">LINUX DO</a>
+
 ## 结构
 
 | 目录 | 说明 |
