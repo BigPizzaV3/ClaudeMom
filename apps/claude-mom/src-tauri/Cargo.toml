@@ -1,6 +1,6 @@
 [package]
 name = "claude-mom"
-description = "用原版 Claude Desktop 的完整功能模式，直连自己的上游"
+description = "不用 Claude 账号，把 API Key 变成 Claude 桌面版的登录模式"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
