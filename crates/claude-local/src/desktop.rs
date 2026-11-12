@@ -101,7 +101,7 @@ pub fn source_app(deadline: Instant) -> Result<PathBuf> {
     Ok(local.join(r"Programs\Claude\Claude.exe"))
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(target_os = "windows")]
 fn claude_package_locations(bytes: &[u8]) -> Result<Vec<String>> {
     // PowerShell 对零、一、多条记录分别输出空白、对象、数组。
     if bytes.iter().all(u8::is_ascii_whitespace) {

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/claude-local",
+  "apps/claude-mom/src-tauri",
 ]
 
 [workspace.package]

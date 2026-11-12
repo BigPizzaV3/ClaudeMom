@@ -98,6 +98,7 @@ fn normalize_proxy_url(value: &str) -> Option<String> {
     Some(format!("http://{value}"))
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 fn parse_windows_proxy_server(value: &str) -> Option<String> {
     let value = value.trim();
     if value.is_empty() {
