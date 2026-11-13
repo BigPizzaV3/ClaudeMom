@@ -206,13 +206,48 @@ pub fn save_book(path: &Path, book: &UpstreamBook) -> Result<()> {
 
 // ── cc-switch ──────────────────────────────────────────────────────────
 
+/// cc-switch 的数据库位置，照它自己的规则找：设置里改过配置目录的（`app_paths.json`）优先，
+/// 其次 `~/.cc-switch`；Windows 上默认位置没有时再看 `HOME` 下的旧位置（v3.10.3 留下的）。
 pub fn default_cc_switch_db() -> PathBuf {
-    directories::BaseDirs::new()
-        .map(|dirs| dirs.home_dir().join(".cc-switch").join("cc-switch.db"))
-        .unwrap_or_else(|| PathBuf::from(".cc-switch/cc-switch.db"))
+    let Some(dirs) = directories::BaseDirs::new() else {
+        return PathBuf::from(".cc-switch/cc-switch.db");
+    };
+    let home = dirs.home_dir();
+    let store = dirs.data_dir().join("com.ccswitch.desktop").join("app_paths.json");
+    if let Some(dir) = cc_switch_dir_override(&store, home) {
+        return dir.join("cc-switch.db");
+    }
+    let default_db = home.join(".cc-switch").join("cc-switch.db");
+    if cfg!(windows) && !default_db.exists()
+        && let Ok(legacy_home) = std::env::var("HOME")
+        && !legacy_home.trim().is_empty()
+    {
+        let legacy_db = PathBuf::from(legacy_home.trim()).join(".cc-switch").join("cc-switch.db");
+        if legacy_db.exists() {
+            return legacy_db;
+        }
+    }
+    default_db
 }
 
-/// cc-switch 里的 Claude 供应商。OpenAI / Gemini 格式的要经它自己的代理转换，这里不收。
+/// cc-switch 设置里自定义的配置目录（存在它的 `app_paths.json` 里）；目录不存在时它自己也会忽略。
+fn cc_switch_dir_override(store: &Path, home: &Path) -> Option<PathBuf> {
+    let store: Value = serde_json::from_str(&std::fs::read_to_string(store).ok()?).ok()?;
+    let raw = store.get("app_config_dir_override")?.as_str()?.trim();
+    let path = if raw == "~" {
+        home.to_path_buf()
+    } else if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+        home.join(rest)
+    } else if raw.is_empty() {
+        return None;
+    } else {
+        PathBuf::from(raw)
+    };
+    path.is_dir().then_some(path)
+}
+
+/// cc-switch 里给 Claude Code（`claude`）和 Claude 桌面版（`claude-desktop`）配的供应商。
+/// OpenAI / Gemini 格式的要经它自己的代理转换，这里不收；两边配了同一组地址和 Key 的只收一次。
 pub fn cc_switch_profiles(db: &Path) -> Result<Vec<UpstreamProfile>> {
     if !db.is_file() {
         bail!("没有找到 cc-switch 的数据库：{}", db.display());
@@ -223,8 +258,9 @@ pub fn cc_switch_profiles(db: &Path) -> Result<Vec<UpstreamProfile>> {
     )
     .with_context(|| format!("打开 cc-switch 数据库失败：{}", db.display()))?;
     let mut statement = connection.prepare(
-        "SELECT id, name, settings_config, COALESCE(meta, '{}') FROM providers \
-         WHERE app_type = 'claude' ORDER BY COALESCE(sort_index, 0), created_at",
+        "SELECT id, app_type, name, settings_config, COALESCE(meta, '{}') FROM providers \
+         WHERE app_type IN ('claude', 'claude-desktop') \
+         ORDER BY app_type = 'claude-desktop', COALESCE(sort_index, 0), created_at",
     )?;
     let rows = statement.query_map([], |row| {
         Ok((
@@ -232,26 +268,44 @@ pub fn cc_switch_profiles(db: &Path) -> Result<Vec<UpstreamProfile>> {
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
         ))
     })?;
-    let mut profiles = Vec::new();
+    let mut profiles: Vec<UpstreamProfile> = Vec::new();
+    let mut other_formats = 0;
     for row in rows {
-        let (id, name, settings, meta) = row?;
-        if let Some(profile) = cc_switch_profile(&id, &name, &settings, &meta) {
+        let (id, app_type, name, settings, meta) = row?;
+        if api_format(&meta) != "anthropic" {
+            other_formats += 1;
+            continue;
+        }
+        // 桌面版的供应商 id 可能和 Claude Code 的重名（cc-switch 按 id + 类别区分），加前缀免得互相覆盖。
+        let source_id = if app_type == "claude" { id } else { format!("{app_type}:{id}") };
+        let Some(profile) = cc_switch_profile(&source_id, &name, &settings) else { continue };
+        if !profiles
+            .iter()
+            .any(|known| known.base_url == profile.base_url && known.api_key == profile.api_key)
+        {
             profiles.push(profile);
         }
+    }
+    if profiles.is_empty() && other_formats > 0 {
+        bail!(
+            "cc-switch 里的 {other_formats} 个 Claude 供应商都不是 Anthropic 格式（例如 OpenAI Chat），\
+             它们要经 cc-switch 自己的代理转换，ClaudeMom 没法直连。可以在 ClaudeMom 里手动添加 Anthropic 格式的地址和 Key。"
+        );
     }
     Ok(profiles)
 }
 
-fn cc_switch_profile(id: &str, name: &str, settings: &str, meta: &str) -> Option<UpstreamProfile> {
-    let format = serde_json::from_str::<Value>(meta)
+fn api_format(meta: &str) -> String {
+    serde_json::from_str::<Value>(meta)
         .ok()
         .and_then(|meta| meta.get("apiFormat").and_then(Value::as_str).map(str::to_string))
-        .unwrap_or_else(|| "anthropic".into());
-    if format != "anthropic" {
-        return None;
-    }
+        .unwrap_or_else(|| "anthropic".into())
+}
+
+fn cc_switch_profile(id: &str, name: &str, settings: &str) -> Option<UpstreamProfile> {
     let settings: Value = serde_json::from_str(settings).ok()?;
     let env = settings.get("env")?;
     let text = |key: &str| {
@@ -565,10 +619,29 @@ mod tests {
         );
         insert("c", "codex", "Codex", json!({"env": {"ANTHROPIC_BASE_URL": "https://x"}}), json!({}));
         insert("d", "claude", "无地址", json!({"env": {}}), json!({}));
+        // cc-switch 4.x 给 Claude 桌面版单独配的供应商；id 和 Claude Code 的重名也不互相覆盖。
+        insert(
+            "a",
+            "claude-desktop",
+            "Kimi",
+            json!({"env": {"ANTHROPIC_BASE_URL": "https://kimi.example/anthropic", "ANTHROPIC_AUTH_TOKEN": "k"}}),
+            json!({"claudeDesktopMode": "direct", "apiFormat": "anthropic"}),
+        );
+        // 两边配了同一组地址和 Key：只收一次。
+        insert(
+            "e",
+            "claude-desktop",
+            "GLM（桌面）",
+            json!({"env": {"ANTHROPIC_BASE_URL": "https://open.bigmodel.example/api/anthropic", "ANTHROPIC_AUTH_TOKEN": "tok"}}),
+            json!({"claudeDesktopMode": "direct"}),
+        );
         drop(connection);
 
         let profiles = cc_switch_profiles(&db).unwrap();
-        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles.len(), 2);
+        let kimi = &profiles[1];
+        assert_eq!((kimi.name.as_str(), kimi.base_url.as_str()), ("Kimi", "https://kimi.example/anthropic"));
+        assert_eq!(kimi.source_id, "claude-desktop:a");
         let glm = &profiles[0];
         assert_eq!(glm.name, "GLM");
         assert_eq!(glm.api_key, "tok");
@@ -577,6 +650,41 @@ mod tests {
         assert_eq!(glm.models, ["glm-5", "glm-5-air"]);
         assert_eq!((glm.source.as_str(), glm.source_id.as_str()), (SOURCE_CC_SWITCH, "a"));
         assert!(cc_switch_profiles(&dir.path().join("missing.db")).is_err());
+    }
+
+    #[test]
+    fn cc_switch_with_only_openai_format_providers_explains_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cc-switch.db");
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE providers (id TEXT, app_type TEXT, name TEXT, settings_config TEXT, \
+                 meta TEXT DEFAULT '{}', sort_index INTEGER, created_at INTEGER);
+                 INSERT INTO providers VALUES ('x', 'claude-desktop', 'DeepSeek', \
+                 '{\"env\":{\"ANTHROPIC_BASE_URL\":\"https://api.deepseek.example\"}}', \
+                 '{\"apiFormat\":\"openai_chat\"}', 0, 0);",
+            )
+            .unwrap();
+        drop(connection);
+        let error = format!("{:#}", cc_switch_profiles(&db).unwrap_err());
+        assert!(error.contains("1 个") && error.contains("Anthropic 格式"), "{error}");
+    }
+
+    #[test]
+    fn cc_switch_custom_config_dir_is_honoured() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom = dir.path().join("my-ccs");
+        std::fs::create_dir_all(&custom).unwrap();
+        let store = dir.path().join("app_paths.json");
+        std::fs::write(&store, json!({"app_config_dir_override": custom.to_string_lossy()}).to_string()).unwrap();
+        assert_eq!(cc_switch_dir_override(&store, dir.path()), Some(custom.clone()));
+        std::fs::write(&store, json!({"app_config_dir_override": "~/my-ccs"}).to_string()).unwrap();
+        assert_eq!(cc_switch_dir_override(&store, dir.path()), Some(custom));
+        // 目录不存在、没设置：都回到默认位置。
+        std::fs::write(&store, json!({"app_config_dir_override": "/nope/missing"}).to_string()).unwrap();
+        assert_eq!(cc_switch_dir_override(&store, dir.path()), None);
+        assert_eq!(cc_switch_dir_override(&dir.path().join("none.json"), dir.path()), None);
     }
 
     #[test]
