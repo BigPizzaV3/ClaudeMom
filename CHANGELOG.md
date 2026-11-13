@@ -1,5 +1,11 @@
 # 更新日志
 
+## 0.1.2 - 2026-11-13
+
+- 从 cc-switch 导入：也读取给 Claude 桌面版单独配的供应商（cc-switch 新版的「Claude Desktop」页），同一组地址和 Key 只导入一次。
+- 从 cc-switch 导入：按 cc-switch 自己的规则找数据库，设置里改过配置目录的也能找到。
+- cc-switch 里只有 OpenAI 格式的供应商时，说明原因，不再只提示「没有找到」。
+
 ## 0.1.1 - 2026-11-12
 
 - macOS：改由系统（LaunchServices）启动 Claude，屏幕录制、辅助功能等隐私权限按 Claude 自己计算，不再显示「未请求」。
