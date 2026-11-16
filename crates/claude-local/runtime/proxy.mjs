@@ -113,6 +113,9 @@ const MAX_DICTATION_WS_CONNECTIONS = 4;
 const MAX_DICTATION_WS_BYTES = 26 * 1024 * 1024;
 const MAX_DICTATION_WS_IDLE_MS = 130_000;
 const MAX_DICTATION_WS_DURATION_MS = 16 * 60_000;
+// Desktop 的 policy-limits 校验器要求 restrictions 是非 null 对象（不能是数组）；
+// compliance_taints 可选数组，defaults 可选对象。
+const POLICY_LIMITS = { restrictions: {}, compliance_taints: [], defaults: {}, artifact_create_notice: null };
 const DICTATION_ALLOWED_HOSTS = new Set(["claude.ai", "claude.com", "api.anthropic.com"]);
 const DICTATION_ALLOWED_ORIGINS = new Set(["https://claude.ai", "https://claude.com"]);
 let lastClientAt = null;
@@ -1756,7 +1759,7 @@ function handle(req, res, hostHeader) {
       }
       // 远端托管策略：本地空放行（不挡插件/连接器）。
       // CLI 比 Desktop 校验更严格，settings 响应必须包含 uuid/checksum/settings。
-      // policy_limits → {restrictions:[],compliance_taints:[],defaults:{}}（BymwSUZ2 校验器）
+      // policy_limits → {restrictions:{},compliance_taints:[],defaults:{}}（BymwSUZ2 校验器）
       if (/^\/api\/claude_code\/settings/.test(url.pathname)) {
         const body = JSON.stringify({ uuid: ORG.uuid, settings: {}, content: { entries: {} }, checksum: "local-1" });
         res.writeHead(200, {
@@ -1768,7 +1771,7 @@ function handle(req, res, hostHeader) {
         return res.end(body);
       }
       if (/^\/api\/claude_code\/policy_limits/.test(url.pathname)) {
-        return json(res, { restrictions: {}, compliance_taints: [], defaults: {}, artifact_create_notice: null });
+        return json(res, POLICY_LIMITS);
       }
       // token 计数：网关不一定实现，本地估算
       if (req.method === "POST" && url.pathname === "/v1/messages/count_tokens") {
@@ -1819,7 +1822,7 @@ function handle(req, res, hostHeader) {
     return res.end(body);
   }
   if (MODE !== "passthrough" && /^\/api\/claude_code\/policy_limits/.test(url.pathname)) {
-    return json(res, { restrictions: {}, compliance_taints: [], defaults: {}, artifact_create_notice: null });
+    return json(res, POLICY_LIMITS);
   }
   if (MODE !== "passthrough" && /^\/api\/claude_cli\/bootstrap/.test(url.pathname)) {
     return json(res, { client_data: {}, settings: {}, config: {}, enabled: true, environments: [], sessions: [], plugins: [], items: [], data: [] });
@@ -2161,7 +2164,7 @@ const outer = http.createServer((req, res) => {
     return json(res, { client_data: {}, settings: {}, config: {}, enabled: true, environments: [], sessions: [], plugins: [], items: [], data: [] });
   }
   if (/^\/api\/claude_code\/policy_limits/.test(u.pathname)) {
-    return json(res, { restrictions: {}, compliance_taints: [], defaults: {}, artifact_create_notice: null });
+    return json(res, POLICY_LIMITS);
   }
   if (/^\/api\/claude_code\//.test(u.pathname)) {
     const body = JSON.stringify({ uuid: ORG.uuid, settings: {}, content: { entries: {} }, checksum: "local-1" });
@@ -2233,4 +2236,3 @@ if (runtime.managed) {
   process.stdin.on("end", shutdown);
   process.stdin.resume();
 }
-

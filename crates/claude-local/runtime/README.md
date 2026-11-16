@@ -337,8 +337,9 @@ Local/Session Storage leveldb 日志。
   代理 8899 端口同时接受普通 HTTP，剥掉 diagnostics/metadata.diagnostics 再转 magpie；
   `ANTHROPIC_BASE_URL` 指向 8899 即可。settings.json 备份为 .bak-claude-local。
 - 托管设置：`GET /api/claude_code/settings` → `{uuid,settings:{},checksum:"local-1"}`+ETag；
-  `policy_limits` → `{restrictions:[],compliance_taints:[],defaults:{},artifact_create_notice:null}`
-  （schema 来自 index.chunk-BMmeHQk-/BymwSUZ2）。claude.ai 与 8899 直连两条路径都需 mock。
+  `policy_limits` → `{restrictions:{},compliance_taints:[],defaults:{},artifact_create_notice:null}`
+  （app.asar 的 policy-limits 校验器要求 `restrictions` 是非 null 对象，不能是数组）。
+  claude.ai 与 8899 直连两条路径都需 mock。
 - `count_tokens` 本地估算；`/v1/models` mock；`/v1/messages` 转本地 gateway。
 
 ## 2026-11-08：Code 托管设置警告的根因与验证
