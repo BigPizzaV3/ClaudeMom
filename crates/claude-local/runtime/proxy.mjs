@@ -1768,7 +1768,7 @@ function handle(req, res, hostHeader) {
         return res.end(body);
       }
       if (/^\/api\/claude_code\/policy_limits/.test(url.pathname)) {
-        return json(res, { restrictions: [], compliance_taints: [], defaults: {}, artifact_create_notice: null });
+        return json(res, { restrictions: {}, compliance_taints: [], defaults: {}, artifact_create_notice: null });
       }
       // token 计数：网关不一定实现，本地估算
       if (req.method === "POST" && url.pathname === "/v1/messages/count_tokens") {
@@ -1819,7 +1819,7 @@ function handle(req, res, hostHeader) {
     return res.end(body);
   }
   if (MODE !== "passthrough" && /^\/api\/claude_code\/policy_limits/.test(url.pathname)) {
-    return json(res, { restrictions: [], compliance_taints: [], defaults: {}, artifact_create_notice: null });
+    return json(res, { restrictions: {}, compliance_taints: [], defaults: {}, artifact_create_notice: null });
   }
   if (MODE !== "passthrough" && /^\/api\/claude_cli\/bootstrap/.test(url.pathname)) {
     return json(res, { client_data: {}, settings: {}, config: {}, enabled: true, environments: [], sessions: [], plugins: [], items: [], data: [] });
@@ -2161,7 +2161,7 @@ const outer = http.createServer((req, res) => {
     return json(res, { client_data: {}, settings: {}, config: {}, enabled: true, environments: [], sessions: [], plugins: [], items: [], data: [] });
   }
   if (/^\/api\/claude_code\/policy_limits/.test(u.pathname)) {
-    return json(res, { restrictions: [], compliance_taints: [], defaults: {}, artifact_create_notice: null });
+    return json(res, { restrictions: {}, compliance_taints: [], defaults: {}, artifact_create_notice: null });
   }
   if (/^\/api\/claude_code\//.test(u.pathname)) {
     const body = JSON.stringify({ uuid: ORG.uuid, settings: {}, content: { entries: {} }, checksum: "local-1" });
@@ -2233,3 +2233,4 @@ if (runtime.managed) {
   process.stdin.on("end", shutdown);
   process.stdin.resume();
 }
+

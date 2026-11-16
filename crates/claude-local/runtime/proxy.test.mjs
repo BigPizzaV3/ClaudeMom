@@ -732,6 +732,15 @@ test("model requests strip diagnostics and preserve the rest of the payload", as
   assert.deepEqual(gatewayRequests.at(-1), { path: "/v1/messages?beta=true", body: payload });
 });
 
+test("policy limits keep the object shape the desktop validator expects", async () => {
+  const result = await request("/api/claude_code/policy_limits", { host: "claude.ai" });
+  assert.equal(result.status, 200);
+  assert.equal(typeof result.body.restrictions, "object");
+  assert.equal(Array.isArray(result.body.restrictions), false);
+  assert.deepEqual(result.body.restrictions, {});
+  assert.deepEqual(result.body.compliance_taints, []);
+});
+
 test("document navigations replay the app shell rather than logged-out landing stubs", async () => {
   const cacheWrite = (key, body, meta) => {
     const cp = path.join(dictationCacheDir, crypto.createHash("sha1").update(key).digest("hex"));
