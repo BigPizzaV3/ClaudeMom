@@ -227,7 +227,7 @@ export function createConversationService({ ensureConv, listConvs, log, onChange
         conv: conversation({
           id: conv.uuid,
           model: conv.model,
-          title: conv.name !== "New conversation" ? conv.name : undefined,
+          title: conv.name && conv.name !== "New conversation" ? conv.name : undefined,
           status: 1, leaf: turn.asstId,
           created: conv.created_at ? new Date(conv.created_at) : undefined,
           updated: new Date(conv.updated_at),

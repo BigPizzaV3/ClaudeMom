@@ -10,6 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import tls from "node:tls";
+import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
 import { decode, get, asMsg, asStr, ld, vi } from "./rpc.mjs";
@@ -996,6 +997,27 @@ test("REST completions show the upstream's error in the reply and end the stream
   assert.deepEqual(detail.json.chat_messages.map((m) => [m.sender, m.text]), [["human", "case:crlf"], ["assistant", "换行 ok"]]);
   assert.equal(detail.json.current_leaf_message_uuid, detail.json.chat_messages[1].uuid);
   assert.equal(service.output().includes("invalid x-api-key"), false, "受管模式不把上游错误细节写进日志");
+});
+
+test("REST completions accept compressed request bodies and conversations can be renamed and deleted", async () => {
+  const conv = crypto.randomUUID();
+  const base = `/api/organizations/local/chat_conversations/${conv}`;
+  for (const [encoding, encode] of [["gzip", zlib.gzipSync], ["br", zlib.brotliCompressSync], ["deflate", zlib.deflateSync]]) {
+    const body = Buffer.from(JSON.stringify({
+      prompt: "压缩过的提问",
+      turn_message_uuids: { human_message_uuid: crypto.randomUUID(), assistant_message_uuid: crypto.randomUUID() },
+    }));
+    await request(service, `${base}/completion`, { host: "claude.ai", body: encode(body), extraHeaders: { "content-encoding": encoding } });
+    assert.equal(received.at(-1).body.messages.at(-1).content, "压缩过的提问", `${encoding} 请求体要先解压`);
+  }
+  // 首条用户消息兜底命名
+  assert.equal((await request(service, base, { host: "claude.ai" })).json.name, "压缩过的提问");
+  const renamed = await request(service, base, { host: "claude.ai", method: "PATCH", body: { name: "  新名字  " } });
+  assert.equal(renamed.json.name, "新名字");
+  const deleted = await request(service, base, { host: "claude.ai", method: "DELETE" });
+  assert.equal(deleted.status, 204);
+  const list = await request(service, "/api/organizations/local/chat_conversations", { host: "claude.ai" });
+  assert.equal(list.json.some((c) => c.uuid === conv), false);
 });
 
 test("RPC replies carry the upstream's HTTP error and RPC conversations open with their messages", async () => {
