@@ -87,7 +87,7 @@ pub fn run() {
             }
         }
         tauri::RunEvent::Exit => {
-            claude_local::stop_backend();
+            claude_local::shutdown_on_exit();
             claude_local::dictation::server::remove_receipt();
             log::append("app.exit", serde_json::json!({}));
         }

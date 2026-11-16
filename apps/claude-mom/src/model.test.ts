@@ -5,7 +5,7 @@ import { claudeState, emptyProfile, formatWindow, hostOf, normalizeModels, profi
 
 const status = (patch: Partial<ClaudeStatus> = {}): ClaudeStatus => ({
   supported: true, sourceApp: "", version: "1.0", claudeRunning: false, running: false, connected: false,
-  caReady: true, caTrusted: true, nodeAvailable: true, dictationReady: true, models: [], needsRestart: false,
+  caReady: true, caTrusted: true, caMachineSupported: true, caMachineTrusted: false, nodeAvailable: true, dictationReady: true, models: [], needsRestart: false,
   config: { enabled: true, model: "", localization: true, voiceInput: false, computerUse: false, backgroundMode: false },
   ...patch,
 });

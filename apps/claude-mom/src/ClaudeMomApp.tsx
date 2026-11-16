@@ -25,7 +25,7 @@ import { checkForUpdate, currentVersion, installUpdate, type UpdateState } from 
 
 type Tab = "upstream" | "claude";
 type Notice = { text: string; tone: "ok" | "error" } | null;
-type ClaudeAction = "launch" | "stop" | "trust" | "untrust" | "prepare" | "sync_sessions";
+type ClaudeAction = "launch" | "stop" | "trust" | "untrust" | "trust_machine" | "prepare" | "sync_sessions";
 
 const errorText = (cause: unknown) => (cause instanceof Error ? cause.message : String(cause));
 
@@ -677,6 +677,12 @@ function ClaudeSettings({ status, busy, onConfigure, onAction, onVoice, update, 
       <details className="cm-more">
         <summary>高级</summary>
         <Toggle checked={config.cowork ?? true} detail="关掉后按 Claude 自己的开关，新版 Claude 通常只剩 Chat / Code。系统条件（Windows 需商店版、虚拟化可用）仍由 Claude 检查" disabled={disabled} label="Cowork" onChange={(next) => onConfigure({ cowork: next })} />
+        {config.cowork && status.caMachineSupported && !status.caMachineTrusted ? (
+          <div className="cm-row-actions" title="Cowork 虚拟机服务以 LocalSystem 运行，只读取本机根证书。">
+            <span className="cm-field-hint cm-grow">Cowork 虚拟机需要系统级根证书（需管理员授权）。</span>
+            <button className="cm-btn cm-btn-small" disabled={busy !== null} onClick={() => onAction("trust_machine")} type="button"><ShieldCheck />安装系统证书</button>
+          </div>
+        ) : null}
         <Toggle checked={config.localShell ?? false} detail="实验性：界面资源都从本机读，首次启动不用联网补拉上千个文件。目前打开后界面变英文、不显示用户名、发不了消息，只供测试" disabled={disabled} label="用本机自带的界面（实验性）" onChange={(next) => onConfigure({ localShell: next })} />
         <Toggle checked={config.hideUnroutedModels ?? true} detail="Claude 自带的 Opus / Sonnet 等条目会被换成默认模型" disabled={disabled} label="只显示上游的模型" onChange={(next) => onConfigure({ hideUnroutedModels: next })} />
         <Toggle checked={config.computerUse} detail="需要系统的 Spotlight 正常工作，否则 Claude 会卡住" disabled={disabled} label="电脑控制" onChange={(next) => onConfigure({ computerUse: next })} />

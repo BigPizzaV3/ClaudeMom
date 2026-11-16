@@ -69,6 +69,8 @@ export type ClaudeStatus = {
   port?: number | null;
   caReady: boolean;
   caTrusted: boolean;
+  caMachineSupported: boolean;
+  caMachineTrusted: boolean;
   nodeAvailable: boolean;
   dictationReady: boolean;
   config: ClaudeConfig;

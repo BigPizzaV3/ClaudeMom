@@ -608,3 +608,78 @@ impl Drop for HandleGuard {
         let _ = unsafe { CloseHandle(self.0) };
     }
 }
+
+#[cfg(windows)]
+fn quote_win_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.chars().any(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '"')) {
+        return arg.to_string();
+    }
+    let mut out = String::from("\"");
+    let mut backslashes = 0usize;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                out.extend(std::iter::repeat('\\').take(backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.extend(std::iter::repeat('\\').take(backslashes));
+                backslashes = 0;
+                out.push(ch);
+            }
+        }
+    }
+    out.extend(std::iter::repeat('\\').take(backslashes * 2));
+    out.push('"');
+    out
+}
+
+#[cfg(windows)]
+pub fn run_elevated_certutil(args: &[&str], timeout: std::time::Duration) -> anyhow::Result<()> {
+    use std::ffi::OsStr;
+    use std::iter::once;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::WAIT_OBJECT_0;
+    use windows::Win32::System::Threading::WaitForSingleObject;
+    use windows::Win32::UI::Shell::{SEE_MASK_NO_CONSOLE, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
+    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+    use windows::core::PCWSTR;
+
+    fn wide_null(value: impl AsRef<OsStr>) -> Vec<u16> {
+        value.as_ref().encode_wide().chain(once(0)).collect()
+    }
+
+    let params = args
+        .iter()
+        .map(|arg| quote_win_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let verb = wide_null("runas");
+    let file = wide_null("certutil.exe");
+    let parameters = wide_null(&params);
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NO_CONSOLE,
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(file.as_ptr()),
+        lpParameters: PCWSTR(parameters.as_ptr()),
+        nShow: SW_HIDE.0,
+        ..Default::default()
+    };
+    unsafe { ShellExecuteExW(&mut info) }
+        .context("未能拉起管理员授权窗口来安装或移除本机根证书")?;
+    if info.hProcess.is_invalid() {
+        anyhow::bail!("系统未返回 certutil 进程句柄");
+    }
+    let _guard = HandleGuard(info.hProcess);
+    let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+    let wait = unsafe { WaitForSingleObject(info.hProcess, millis) };
+    anyhow::ensure!(wait == WAIT_OBJECT_0, "等待本机证书授权超时");
+    let mut exit_code = 1u32;
+    unsafe { GetExitCodeProcess(info.hProcess, &mut exit_code) }
+        .context("无法读取 certutil 退出状态")?;
+    anyhow::ensure!(exit_code == 0, "certutil 退出码 {exit_code}");
+    Ok(())
+}
