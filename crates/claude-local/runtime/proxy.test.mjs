@@ -802,6 +802,39 @@ for (const host of [undefined, "api.anthropic.com", "claude.ai"]) {
   });
 }
 
+test("chat and cowork session title endpoints generate and persist titles via gateway", async () => {
+  const created = await request("/api/organizations/11111111-2222-4333-8444-555555555556/chat_conversations", {
+    host: "claude.ai",
+    body: {},
+  });
+  assert.equal(created.status, 201);
+  assert.equal(created.body.name, "");
+
+  const titled = await request(
+    `/api/organizations/11111111-2222-4333-8444-555555555556/chat_conversations/${created.body.uuid}/title`,
+    {
+      host: "claude.ai",
+      body: { message_content: "Message 1: Golden Gate Bridge presentation\n\nMessage 2: Sure!", recent_titles: [] },
+    },
+  );
+  assert.equal(titled.status, 200);
+  assert.equal(titled.body.title, "ok");
+
+  const fetched = await request(
+    `/api/organizations/11111111-2222-4333-8444-555555555556/chat_conversations/${created.body.uuid}`,
+    { host: "claude.ai" },
+  );
+  assert.equal(fetched.status, 200);
+  assert.equal(fetched.body.name, "ok");
+
+  const coworkTitle = await request(
+    "/api/organizations/11111111-2222-4333-8444-555555555556/dust/generate_session_title",
+    { host: "claude.ai", body: { first_session_message: "Build a Golden Gate Bridge PowerPoint", surface: "cowork" } },
+  );
+  assert.equal(coworkTitle.status, 200);
+  assert.equal(coworkTitle.body.title, "ok");
+});
+
 test("document navigations replay the app shell rather than logged-out landing stubs", async () => {
   const cacheWrite = (key, body, meta) => {
     const cp = path.join(dictationCacheDir, crypto.createHash("sha1").update(key).digest("hex"));

@@ -23,6 +23,7 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { Duplex } from "node:stream";
+import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { createConversationService } from "./conversation-service.mjs";
 import { isPatchedStartupAsset, startupAssets } from "./scripts/patch-dictation-start.mjs";
@@ -348,6 +349,29 @@ function localI18n(pathname) {
 const now = () => new Date().toISOString();
 const log = (...a) => LOG && console.log(`[${now()}]`, ...a);
 
+// Chat 的 completion 请求体字段随客户端版本变化：从常见位置兜底取最近一条用户文本（跳过助手消息）。
+function firstUserText(value, depth = 0) {
+  if (depth > 4 || value == null) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "object" && !Array.isArray(value) && typeof value.role === "string" && value.role !== "user") return "";
+  if (Array.isArray(value)) {
+    for (let i = value.length - 1; i >= 0; i -= 1) {
+      const text = firstUserText(value[i], depth + 1);
+      if (text) return text;
+    }
+    return "";
+  }
+  if (typeof value === "object") {
+    for (const key of ["text", "content", "prompt", "message"]) {
+      if (Object.hasOwn(value, key)) {
+        const text = firstUserText(value[key], depth + 1);
+        if (text) return text;
+      }
+    }
+  }
+  return "";
+}
+
 function json(res, obj, code = 200, extraHeaders = {}) {
   const body = JSON.stringify(obj);
   res.writeHead(code, {
@@ -417,7 +441,7 @@ function ensureConv(uuid) {
   if (!CONV_STATE.has(uuid)) {
     CONV_STATE.set(uuid, {
       uuid,
-      name: "New conversation",
+      name: "",
       created_at: now(),
       updated_at: now(),
       chat_messages: [],
@@ -807,12 +831,13 @@ function convToRest(c, { messages = false } = {}) {
     } catch { REST_CONV_TEMPLATE = {}; }
   }
   const live = c.turns?.some((t) => !t.complete);
+  const title = c.name && c.name !== "New conversation" ? c.name : "";
   return {
     ...REST_CONV_TEMPLATE,
     uuid: c.uuid,
     id: c.uuid,
-    name: c.name || "New conversation",
-    summary: c.name || "New conversation",
+    name: title,
+    summary: title,
     model: c.model || runtime.model,
     created_at: c.created_at,
     updated_at: c.updated_at,
@@ -821,6 +846,98 @@ function convToRest(c, { messages = false } = {}) {
     last_settled_at: live ? null : c.updated_at,
     ...(messages ? { chat_messages: restMessages(c) } : {}),
   };
+}
+
+function extractTitleInput(rawText) {
+  const text = typeof rawText === "string" ? rawText.trim() : "";
+  if (!text) return "";
+  const first = text.match(/^Message 1:\s*([\s\S]*?)(?:\n+\s*Message 2:|$)/i);
+  return (first ? first[1] : text).trim();
+}
+
+function fallbackSessionTitle(rawText, emptyFallback = "New task") {
+  const cleaned = extractTitleInput(rawText)
+    .replace(/^["'“”‘’`《【]+|["'“”‘’`》】]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleaned) return emptyFallback;
+  return cleaned.length > 30 ? `${cleaned.slice(0, 30)}…` : cleaned;
+}
+
+function sanitizeGeneratedTitle(raw) {
+  if (typeof raw !== "string") return "";
+  const tagged = raw.match(/<title>([\s\S]*?)<\/title>/i);
+  const line = (tagged ? tagged[1] : raw)
+    .replace(/\r?\n[\s\S]*$/, "")
+    .replace(/^["'“”‘’`*#:\s]+|["'“”‘’`*\s]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!line) return "";
+  return line.length > 80 ? `${line.slice(0, 80)}…` : line;
+}
+
+function generateSessionTitle(rawText, requestedModel, emptyFallback, callback) {
+  const input = extractTitleInput(rawText);
+  const fallback = fallbackSessionTitle(input, emptyFallback);
+  if (!input) return callback(fallback);
+  let target;
+  try {
+    target = gatewayTarget(runtime, "/v1/messages");
+  } catch {
+    return callback(fallback);
+  }
+  const model = gatewayModel(runtime, runtime.smallModel || requestedModel || runtime.model);
+  const payload = JSON.stringify({
+    model,
+    max_tokens: 128,
+    stream: false,
+    // 推理模型默认先输出 thinking，标题这种短任务会被 thinking 吃满 budget。
+    thinking: { type: "disabled" },
+    system: "Generate a concise session title (3-8 words or short Chinese phrase) in the same language as the user message. Reply with only the title, no quotes or markdown.",
+    messages: [{ role: "user", content: input.slice(0, 2000) }],
+  });
+  let settled = false;
+  const finish = (title) => {
+    if (settled) return;
+    settled = true;
+    callback(title || fallback);
+  };
+  const greq = (target.protocol === "https:" ? https : http).request(
+    {
+      hostname: target.hostname,
+      port: target.port || (target.protocol === "https:" ? 443 : 80),
+      path: target.pathname + target.search,
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "content-length": Buffer.byteLength(payload),
+        "x-api-key": runtime.key,
+        authorization: `Bearer ${runtime.key}`,
+        "anthropic-version": "2023-06-01",
+      },
+      // 网关在跑长任务时首字可能排队：标题生成等久一点，别退回“截断提示词”。
+      timeout: 20000,
+    },
+    (gres) => {
+      const chunks = [];
+      gres.on("data", (chunk) => chunks.push(chunk));
+      gres.on("end", () => {
+        if (gres.statusCode !== 200) return finish(fallback);
+        try {
+          const data = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          const text = Array.isArray(data.content)
+            ? data.content.filter((b) => b?.type === "text" && typeof b.text === "string").map((b) => b.text).join("")
+            : (typeof data.completion === "string" ? data.completion : "");
+          finish(sanitizeGeneratedTitle(text) || fallback);
+        } catch {
+          finish(fallback);
+        }
+      });
+    },
+  );
+  greq.on("timeout", () => { greq.destroy(); finish(fallback); });
+  greq.on("error", () => finish(fallback));
+  greq.end(payload);
 }
 
 function mockApi(req, res, url) {
@@ -1193,26 +1310,93 @@ function mockApi(req, res, url) {
   if (/^\/api\/organizations\/[^/]+$/.test(p)) {
     return json(res, ORG);
   }
+  if (/\/dust\/generate_session_title$/.test(p) && method === "POST") {
+    return readBody(req, (raw) => {
+      const body = decodeJsonBody(req, raw);
+      const firstMsg = body.first_session_message ?? body.message ?? body.prompt ?? "";
+      generateSessionTitle(firstMsg, body.model, "New task", (title) => json(res, { title }));
+    });
+  }
+  if (/\/dust\/generate_title_and_branch$/.test(p) && method === "POST") {
+    return readBody(req, (raw) => {
+      const body = decodeJsonBody(req, raw);
+      const firstMsg = body.first_session_message ?? body.message ?? body.prompt ?? "";
+      generateSessionTitle(firstMsg, body.model, "New session", (title) => {
+        const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 50).replace(/-+$/, "");
+        json(res, { title, branch_name: slug ? `claude/${slug}` : undefined });
+      });
+    });
+  }
   if (/\/chat_conversations$/.test(p)) {
     if (method === "GET") return json(res, [...CONV_STATE.values()].map(convToRest));
     if (method === "POST") {
-      const id = crypto.randomUUID();
-      const conv = ensureConv(id);
-      return json(res, convToRest(conv), 201);
+      return readBody(req, (raw) => {
+        const body = decodeJsonBody(req, raw);
+        const requestedId = typeof body.uuid === "string" && /^[0-9a-f-]{36}$/i.test(body.uuid)
+          ? body.uuid
+          : crypto.randomUUID();
+        const conv = ensureConv(requestedId);
+        if (typeof body.name === "string" && body.name.trim()) {
+          conv.name = body.name.trim().slice(0, 200);
+          conv.updated_at = now();
+          stateStore.flush();
+        }
+        return json(res, convToRest(conv), 201);
+      });
     }
+  }
+  const convTitleMatch = p.match(/\/chat_conversations\/([0-9a-f-]{36})\/title$/);
+  if (convTitleMatch && method === "POST") {
+    return readBody(req, (raw) => {
+      const body = decodeJsonBody(req, raw);
+      const conv = ensureConv(convTitleMatch[1]);
+      const firstHuman = conv.chat_messages.find((m) => m.sender === "human")?.text || "";
+      const source = typeof body.message_content === "string" && body.message_content.trim()
+        ? body.message_content
+        : firstHuman;
+      generateSessionTitle(source, conv.model, "New conversation", (title) => {
+        if (title) {
+          conv.name = title;
+          conv.updated_at = now();
+          stateStore.flush();
+        }
+        json(res, { title });
+      });
+    });
   }
   const convMatch = p.match(/\/chat_conversations\/([^/]+)$/);
   if (convMatch) {
+    if (method === "PUT" || method === "PATCH") {
+      return readBody(req, (raw) => {
+        const body = decodeJsonBody(req, raw);
+        const conv = ensureConv(convMatch[1]);
+        if (typeof body.name === "string") {
+          conv.name = body.name.trim().slice(0, 200);
+          conv.updated_at = now();
+          stateStore.flush();
+        }
+        return json(res, convToRest(conv));
+      });
+    }
+    if (method === "DELETE") {
+      CONV_STATE.delete(convMatch[1]);
+      stateStore.flush();
+      res.writeHead(204, { "content-length": 0 });
+      return res.end();
+    }
     if (CONV_STATE.has(convMatch[1])) return json(res, convToRest(ensureConv(convMatch[1]), { messages: true }));
     return json(res, { error: "not found" }, 404);
   }
   if (/\/completion$/.test(p)) {
-    let raw = "";
-    req.on("data", (c) => (raw += c));
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
-      let body = {};
-      try { body = JSON.parse(raw); } catch {}
-      const prompt = typeof body.prompt === "string" ? body.prompt : "";
+      const body = decodeJsonBody(req, Buffer.concat(chunks));
+      const prompt = (typeof body.prompt === "string" && body.prompt.trim() ? body.prompt : "")
+        || firstUserText(body.messages)
+        || firstUserText(body.message)
+        || firstUserText(body.content)
+        || "";
       const human = body.turn_message_uuids?.human_message_uuid || crypto.randomUUID();
       const asst = body.turn_message_uuids?.assistant_message_uuid || crypto.randomUUID();
       const model = gatewayModel(runtime, body.model || process.env.GATEWAY_MODEL);
@@ -1233,6 +1417,11 @@ function mockApi(req, res, url) {
       const conv = convUuid ? ensureConv(convUuid) : null;
       if (conv && !conv.chat_messages.some((m) => m.uuid === human)) {
         pushMessage(conv, { uuid: human, sender: "human", text: prompt });
+        if ((!conv.name || conv.name === "New conversation") && prompt.trim()) {
+          const compact = prompt.replace(/\s+/g, " ").trim();
+          conv.name = compact.length > 30 ? `${compact.slice(0, 30)}…` : compact;
+          stateStore.changed();
+        }
       }
       let acc = "";
       let settled = false;
@@ -1396,6 +1585,24 @@ function readBody(req, cb) {
   req.on("data", (c) => chunks.push(c));
   req.on("end", () => cb(Buffer.concat(chunks)));
   req.on("error", () => cb(Buffer.alloc(0)));
+}
+
+// Chat 的 completion 请求体可能被客户端按 gzip/br/deflate 压缩；直接 JSON.parse 会得到 {}。
+function decodeJsonBody(req, raw) {
+  const encoding = String(req.headers["content-encoding"] || "").toLowerCase().trim();
+  let bytes = raw;
+  try {
+    if (encoding === "gzip" || encoding === "x-gzip") bytes = zlib.gunzipSync(raw);
+    else if (encoding === "br") bytes = zlib.brotliDecompressSync(raw);
+    else if (encoding === "deflate") bytes = zlib.inflateSync(raw);
+  } catch {
+    bytes = raw;
+  }
+  try {
+    return JSON.parse(bytes.toString("utf8") || "{}");
+  } catch {
+    return {};
+  }
 }
 
 // 文档导航判定：GET + 无扩展名 + 显式要 HTML。/api|/v1|/edge-api 等接口路径在此前分支已返回。
