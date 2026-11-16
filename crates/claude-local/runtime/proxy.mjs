@@ -996,6 +996,10 @@ function mockApi(req, res, url) {
   if (p.startsWith("/api/frame/")) return json(res, pageShape);
   // 客户端按 plugin id 读取元数据字典，每个值都必须是对象。
   if (p.endsWith("/cowork_plugin_metadata")) return json(res, {});
+  // Connector 目录与 Cowork 激活任务：客户端用 zod 校验，空对象会抛
+  // "Invalid BFF response format" 并中断 Cowork 提交，必须给空数组/游标。
+  if (p === "/api/directory/servers") return json(res, { servers: [], next_cursor: null });
+  if (/\/activation\/cowork\/tasks$/.test(p)) return json(res, { tasks: [] });
 
   // Code 模式设备注册：POST 提交 enclave 公钥注册设备行，GET 要看到 {id, k} 行；
   // 空 {} 会触发 device_register_miss(no_row_pk) → "Couldn't verify your sign-in"
@@ -1270,6 +1274,18 @@ function bufferedResponseHeaders(headers, length) {
   return result;
 }
 
+// 超过该大小的响应直接流式转发；Cowork 的 rootfs.vhdx 等 VM 镜像有 1GB+，
+// 全量塞进内存会让客户端 30 秒收不到数据而判定下载停滞。
+const MAX_BUFFERED_RESPONSE_BYTES = 8 * 1024 * 1024;
+
+function streamingResponseHeaders(headers) {
+  const result = { ...headers };
+  for (const name of ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"]) {
+    delete result[name];
+  }
+  return result;
+}
+
 function serveCachedStaticAsset(req, res, url) {
   if (MODE === "passthrough" || !isHashedStaticAsset(req, url)) return false;
   const cacheKey = `${url.host}${url.pathname}${url.search}`;
@@ -1488,6 +1504,13 @@ function proxyUpstream(req, res, url) {
       timeout: 20000,
     },
     (up) => {
+      const length = Number(up.headers["content-length"] || 0);
+      if (!canCache || length > MAX_BUFFERED_RESPONSE_BYTES) {
+        res.writeHead(up.statusCode || 502, streamingResponseHeaders(up.headers));
+        up.pipe(res);
+        up.on("error", () => res.destroy());
+        return;
+      }
       const chunks = [];
       up.on("data", (c) => chunks.push(c));
       up.on("end", () => {
@@ -1958,8 +1981,12 @@ function readDictationReceipt() {
   const receiptPath = path.join(APP_STATE_DIR, "dictation-helper.json");
   try {
     const metadata = fs.lstatSync(receiptPath);
-    if (!metadata.isFile() || metadata.isSymbolicLink() || (metadata.mode & 0o077) !== 0) return null;
-    if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) return null;
+    if (!metadata.isFile() || metadata.isSymbolicLink()) return null;
+    // Windows 的 stat 不提供 POSIX 权限位（普通文件恒为 0o666），只做平台无关校验。
+    if (process.platform !== "win32") {
+      if ((metadata.mode & 0o077) !== 0) return null;
+      if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) return null;
+    }
     const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
     if (
       !Number.isInteger(receipt.port) || receipt.port < 1 || receipt.port > 65535 ||
