@@ -1,0 +1,13 @@
+{
+  "time_alert_daily_minutes": null,
+  "quiet_hours": null,
+  "resolved": {
+    "local_date": "2026-11-17",
+    "total_ms": 126396,
+    "threshold_ms": null,
+    "quiet_until_ms": null,
+    "quiet_windows": [],
+    "snoozed_until_ms": null,
+    "resets_at_ms": 1794931200000
+  }
+}

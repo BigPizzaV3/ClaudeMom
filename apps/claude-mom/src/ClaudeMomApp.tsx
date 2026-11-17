@@ -1,26 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { Check, ChevronDown, Download, Eye, EyeOff, Loader2, Play, Plus, RefreshCw, ShieldCheck, Square, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import {
-  IMPORT_SOURCES,
-  SOURCE_LABELS,
-  WINDOW_PRESETS,
-  claudeState,
-  emptyProfile,
-  formatWindow,
-  hostOf,
-  isOk,
-  modelLabel,
-  normalizeModels,
-  profileProblem,
-  setupSteps,
-  type ClaudeConfig,
-  type ClaudeStatus,
-  type CommandResult,
-  type UpstreamBook,
-  type UpstreamModel,
-  type UpstreamProfile,
-} from "./model";
+import { IMPORT_SOURCES, SOURCE_LABELS, WINDOW_PRESETS, claudeState, emptyProfile, formatWindow, hostOf, isOk, modelLabel, normalizeModels, profileProblem, setupSteps, type ClaudeConfig, type ClaudeStatus, type CommandResult, type UpstreamBook, type UpstreamModel, type UpstreamProfile, templateLabel } from "./model";
 import { checkForUpdate, currentVersion, installUpdate, type UpdateState } from "./updates";
 
 type Tab = "upstream" | "claude";
@@ -223,7 +204,7 @@ export function ClaudeMomApp() {
 
   const state = claudeState(status, busy === "launch" || busy === "stop" ? busy : null);
   const steps = setupSteps(status, active);
-  const canLaunch = Boolean(status?.supported && status.nodeAvailable && status.caTrusted && active && !profileProblem(active));
+  const canLaunch = Boolean(status?.supported && status.nodeAvailable && (status.caTrusted || status.config.threePMode) && active && !profileProblem(active));
   const showStop = Boolean(status?.running || status?.localProcess);
 
   return (
@@ -629,15 +610,49 @@ function ClaudeSettings({ status, busy, onConfigure, onAction, onVoice, update, 
   return (
     <div className="cm-settings">
       <section className="cm-card">
-        <Toggle checked={config.localization} disabled={disabled} label="界面汉化" onChange={(next) => onConfigure({ localization: next })} />
+        <Field
+          hint={config.threePMode
+            ? "Claude 安装包自带的新界面（Claude 的第三方模式）：随 Claude 更新，对话、Cowork、Code 由 Claude 直接调本地服务转给上游。没有账号相关的功能，不用信任证书，目前只有英文"
+            : "按 claude.ai 录制的界面，模拟一个 claude.ai 账号：功能最全，有中文"}
+          label="界面"
+        >
+          <select disabled={disabled} onChange={(event) => onConfigure({ threePMode: event.currentTarget.value === "local" })} value={config.threePMode ? "local" : "recorded"}>
+            <option value="recorded">录制版（默认）</option>
+            <option value="local">本机版（第三方模式）</option>
+          </select>
+        </Field>
+        {!config.threePMode && (status.templates?.length ?? 0) > 1 ? (
+          <Field hint="录制时的 claude.ai 版本（接口数据 + 页面外壳）。新版本功能新；新版本有问题时可以换回旧的。前端代码按所选版本从 Anthropic 下载" label="版本">
+            <select
+              disabled={disabled}
+              onChange={(event) => onConfigure({ template: event.currentTarget.value })}
+              value={status.templates?.some((template) => template.build === config.template) ? config.template : ""}
+            >
+              <option value="">最新（{templateLabel(status.templates![0])}）</option>
+              {status.templates!.map((template) => <option key={template.build} value={template.build}>{templateLabel(template)}</option>)}
+            </select>
+          </Field>
+        ) : null}
+        {config.threePMode ? null : (
+          <Toggle checked={config.hubHome ?? false} detail="Claude 正在小范围试验的主页布局：对话和 Cowork 合在一个输入框里，没有「对话 | Cowork」切换。关着时用有切换的经典主页" disabled={disabled} label="合并式主页（实验）" onChange={(next) => onConfigure({ hubHome: next })} />
+        )}
+        <Toggle
+          checked={config.localization}
+          detail={config.threePMode ? "本机版不支持：这套界面只读 Claude 安装包里自带的语言包，里面没有中文（菜单等桌面部分跟随系统语言）" : undefined}
+          disabled={disabled || config.threePMode}
+          label="界面汉化"
+          onChange={(next) => onConfigure({ localization: next })}
+        />
         <Toggle
           checked={config.voiceInput}
-          detail="Claude 输入框里的麦克风，用本机 SenseVoice 转写，音频不出本机。改完重新启动 Claude 生效。"
-          disabled={disabled}
+          detail={config.threePMode
+            ? "本机版暂不支持：第三方模式下的听写只对接 Claude 的网关单点登录（SSO），本地服务还没实现"
+            : "Claude 输入框里的麦克风，用本机 SenseVoice 转写，音频不出本机。改完重新启动 Claude 生效。"}
+          disabled={disabled || config.threePMode}
           label="语音输入"
           onChange={onVoice}
         />
-        {config.voiceInput && !status.dictationReady ? <VoiceModel onReady={() => onAction("prepare")} /> : null}
+        {config.voiceInput && !config.threePMode && !status.dictationReady ? <VoiceModel onReady={() => onAction("prepare")} /> : null}
         <Toggle
           checked={config.importCliSessions ?? true}
           detail="启动 Claude 前，把终端、BaoCode 等命令行里建的会话加进左侧列表（已在列表里的、删过的不会重复加）。"
@@ -683,7 +698,6 @@ function ClaudeSettings({ status, busy, onConfigure, onAction, onVoice, update, 
             <button className="cm-btn cm-btn-small" disabled={busy !== null} onClick={() => onAction("trust_machine")} type="button"><ShieldCheck />安装系统证书</button>
           </div>
         ) : null}
-        <Toggle checked={config.localShell ?? false} detail="实验性：界面资源都从本机读，首次启动不用联网补拉上千个文件。目前打开后界面变英文、不显示用户名、发不了消息，只供测试" disabled={disabled} label="用本机自带的界面（实验性）" onChange={(next) => onConfigure({ localShell: next })} />
         <Toggle checked={config.hideUnroutedModels ?? true} detail="Claude 自带的 Opus / Sonnet 等条目会被换成默认模型" disabled={disabled} label="只显示上游的模型" onChange={(next) => onConfigure({ hideUnroutedModels: next })} />
         <Toggle checked={config.computerUse} detail="需要系统的 Spotlight 正常工作，否则 Claude 会卡住" disabled={disabled} label="电脑控制" onChange={(next) => onConfigure({ computerUse: next })} />
         <Toggle checked={config.backgroundMode} disabled={disabled} label="后台模式" onChange={(next) => onConfigure(next ? { backgroundMode: true } : { backgroundMode: false, forceBackgroundMode: false })} />

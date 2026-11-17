@@ -267,7 +267,10 @@ test("fresh managed profile serves the installed official shell and bounded ASAR
   const shellHtml = shell.bytes.toString("utf8");
   assert.match(shellHtml, /data-build-id="fixture-build"/);
   assert.doesNotMatch(shellHtml, /stale private login shell/);
-  assert.match(shellHtml, /<meta name="i18n-catalogs" data-i18n-catalogs="en-US:1\.1\.1,zh-Hans:1\.1\.1">/);
+  assert.match(shellHtml, /<meta name="i18n-catalogs" data-i18n-catalogs="en-US:local\.local,zh-Hans:local\.local">/);
+  // 前端按 locale:基础.动态 两段解析版本号（三段会整张表解析失败，界面退回英文）。
+  const catalogs = shellHtml.match(/data-i18n-catalogs="([^"]+)"/)[1].split(",");
+  assert.ok(catalogs.every((entry) => /^([\w-]+):([\w-]+)\.([\w-]+)$/.test(entry)), catalogs.join(","));
   const shimIndex = shellHtml.indexOf('<script src="/__codex_plus/claude-localization.js"></script>');
   const firstAppScript = shellHtml.indexOf("<script>");
   assert.ok(shellHtml.indexOf('name="i18n-catalogs"') < firstAppScript);
@@ -372,6 +375,35 @@ test("installed template fetches the first shell through the configured upstream
   }
 });
 
+test("installed templates come in recorded versions and the chosen one is used, newest by default", async () => {
+  const runtimeDir = path.join(root, "versioned-template-runtime");
+  fs.cpSync(path.join(root, "runtime"), runtimeDir, { recursive: true });
+  const mock = path.join(runtimeDir, "mock");
+  fs.rmSync(mock, { recursive: true, force: true });
+  fs.mkdirSync(mock, { recursive: true });
+  fs.writeFileSync(path.join(mock, ".codex-plus-template"), "");
+  for (const [build, time] of [["older-build", 1794046356], ["newer-build", 1794603257]]) {
+    fs.mkdirSync(path.join(mock, build, "api"), { recursive: true });
+    fs.writeFileSync(path.join(mock, build, "bootstrap.json"), JSON.stringify({ gated_imports_build_id: build, gated_imports: {} }));
+    fs.writeFileSync(path.join(mock, build, "shell.html"),
+      `<!doctype html><html data-build-id="${build}" data-build-timestamp="${time}"><head></head><body>${build} ${"s".repeat(5000)}</body></html>`);
+  }
+  const served = async (extra) => {
+    const instance = await start({ CLAUDE_LOCAL_CACHE_DIR: path.join(runtimeDir, ".cache"), ...extra }, runtimeDir);
+    try {
+      const bootstrap = (await request(instance, "/edge-api/bootstrap", { host: "claude.ai" })).json;
+      const shell = (await request(instance, "/new", { host: "claude.ai", extraHeaders: { accept: "text/html" } })).bytes.toString("utf8");
+      return { bootstrap: bootstrap.gated_imports_build_id, shell: shell.match(/data-build-id="([^"]+)"/)?.[1] };
+    } finally {
+      await stop(instance);
+    }
+  };
+  assert.deepEqual(await served({}), { bootstrap: "newer-build", shell: "newer-build" }, "没选时用最新的");
+  assert.deepEqual(await served({ CLAUDE_LOCAL_TEMPLATE: "older-build" }), { bootstrap: "older-build", shell: "older-build" });
+  assert.deepEqual(await served({ CLAUDE_LOCAL_TEMPLATE: "retired-build" }), { bootstrap: "newer-build", shell: "newer-build" }, "选的版本下架了就用最新的");
+  assert.deepEqual(await served({ CLAUDE_LOCAL_TEMPLATE: "../older-build" }), { bootstrap: "newer-build", shell: "newer-build" }, "只认版本目录名");
+});
+
 test("installed template with its own shell never serves an online or cached shell of another build", async () => {
   // 新用户没有缓存时会从 claude.ai 拉到当前线上版本，与按旧版本录制的模板对不上（界面错乱、Code 页卡住）。
   // 模板自带同一次录制的外壳时，主站页面导航一律用它；已经缓存了线上新版本的老用户也恢复。
@@ -415,47 +447,6 @@ test("installed template with its own shell never serves an online or cached she
     assert.equal(bootstrap.status, 200);
     assert.ok(bootstrap.json);
     assert.deepEqual(connects, [], "模板自带外壳时不去线上抓");
-  } finally {
-    await stop(instance);
-    upstreamProxy.close();
-  }
-});
-
-test("installed template serves the local official shell when the experimental switch is on", async () => {
-  // 线上外壳引用的资源与本机 ion-dist 对不上，首次启动会补拉上千个文件；实验开关打开时改用本机外壳。
-  const connects = [];
-  const upstreamProxy = http.createServer();
-  upstreamProxy.on("connect", (req, socket) => {
-    connects.push(req.url);
-    socket.end("HTTP/1.1 403 Forbidden\r\n\r\n");
-  });
-  upstreamProxy.listen(0, "127.0.0.1");
-  await once(upstreamProxy, "listening");
-  const runtimeDir = path.join(root, "local-shell-runtime");
-  fs.cpSync(path.join(root, "runtime"), runtimeDir, { recursive: true });
-  fs.writeFileSync(path.join(runtimeDir, "mock", ".codex-plus-template"), "");
-  fs.writeFileSync(path.join(runtimeDir, "mock", "bootstrap.json"), JSON.stringify({
-    gated_imports_build_id: "online-build",
-    gated_imports: { "online-module": { preload: ["online-chunk.js"] } },
-  }));
-  const instance = await start({
-    CLAUDE_LOCAL_CACHE_DIR: path.join(runtimeDir, ".cache"),
-    CLAUDE_LOCAL_UPSTREAM_PROXY: `http://127.0.0.1:${upstreamProxy.address().port}`,
-    CLAUDE_LOCAL_LOCAL_SHELL: "1",
-  }, runtimeDir);
-  try {
-    for (const pathname of ["/new", "/settings/general"]) {
-      const shell = await request(instance, pathname, { host: "claude.ai" });
-      assert.equal(shell.status, 200);
-      assert.match(shell.bytes.toString("utf8"), /data-build-id="fixture-build"/);
-    }
-    const asset = await request(instance, "/claude-ai/v2/assets/v1/main.js", { host: "assets-proxy.anthropic.com" });
-    assert.equal(asset.bytes.toString("utf8"), "export const localOfficialAsset = true;");
-    // 模板里线上版本的分块清单换成本机版本，否则客户端会去拉对不上的分块。
-    const bootstrap = await request(instance, "/edge-api/bootstrap", { host: "claude.ai" });
-    assert.equal(bootstrap.json.gated_imports_build_id, "fixture-build");
-    assert.deepEqual(bootstrap.json.gated_imports, {});
-    assert.deepEqual(connects, [], "本机外壳不需要联网");
   } finally {
     await stop(instance);
     upstreamProxy.close();
@@ -584,7 +575,7 @@ test("unpacked ion-dist directory is served when the Claude build ships no ASAR"
   }
 });
 
-test("installed template turns on the Cowork GrowthBook gate unless disabled", async () => {
+test("installed template turns on Cowork and uses the classic home unless the new home is chosen", async () => {
   // 录制模板里 yukon_silver（574905726）是 false，新版 Claude 只显示 Chat / Code（issue #4）。
   const runtimeDir = path.join(root, "cowork-runtime");
   fs.cpSync(path.join(root, "runtime"), runtimeDir, { recursive: true });
@@ -592,24 +583,43 @@ test("installed template turns on the Cowork GrowthBook gate unless disabled", a
   fs.writeFileSync(path.join(runtimeDir, "mock", "bootstrap.json"), JSON.stringify({
     org_growthbook: {
       hashing_algorithm: "djb2",
-      features: { "574905726": { defaultValue: false }, "577907085": { defaultValue: true } },
+      features: {
+        "574905726": { defaultValue: false },
+        "577907085": { defaultValue: true },
+        // claude_ai_hub_web_delivery：录制账号在新主页实验组里，新主页藏掉了「Chat | Cowork」切换。
+        "2436273311": { defaultValue: true },
+      },
+    },
+    gated_imports_build_id: "fixture-build",
+    gated_imports: {
+      claude_ai_hub_web_delivery: { hash: "hub", css: [], preload: [] },
+      cardinal: { hash: "cardinal", css: [], preload: [] },
     },
   }));
   const env = { CLAUDE_LOCAL_CACHE_DIR: path.join(runtimeDir, ".cache") };
   const features = async (extra) => {
     const instance = await start({ ...env, ...extra }, runtimeDir);
     try {
-      return (await request(instance, "/edge-api/bootstrap", { host: "claude.ai" })).json.org_growthbook;
+      return (await request(instance, "/edge-api/bootstrap", { host: "claude.ai" })).json;
     } finally {
       await stop(instance);
     }
   };
   const on = await features({});
-  assert.deepEqual(on.features["574905726"], { defaultValue: true });
-  assert.deepEqual(on.features["577907085"], { defaultValue: true }, "其它功能保持模板原值");
-  assert.equal(on.hashing_algorithm, "djb2");
+  assert.deepEqual(on.org_growthbook.features["574905726"], { defaultValue: true });
+  assert.deepEqual(on.org_growthbook.features["577907085"], { defaultValue: true }, "其它功能保持模板原值");
+  assert.equal(on.org_growthbook.hashing_algorithm, "djb2");
+  // 默认经典主页：合并式主页的开关和按 gated_imports 下发的代码都要去掉，「对话 | Cowork」切换才会出现。
+  assert.deepEqual(on.org_growthbook.features["2436273311"], { defaultValue: false });
+  assert.deepEqual(Object.keys(on.gated_imports), ["cardinal"]);
   const off = await features({ CLAUDE_LOCAL_COWORK: "0" });
-  assert.deepEqual(off.features["574905726"], { defaultValue: false });
+  assert.deepEqual(off.org_growthbook.features["574905726"], { defaultValue: false });
+  assert.deepEqual(off.org_growthbook.features["2436273311"], { defaultValue: false }, "主页样式和 Cowork 开关互不相干");
+  // 设置里选了合并式主页：两处都按模板原样。
+  const hub = await features({ CLAUDE_LOCAL_HUB_HOME: "1" });
+  assert.deepEqual(hub.org_growthbook.features["574905726"], { defaultValue: true });
+  assert.deepEqual(hub.org_growthbook.features["2436273311"], { defaultValue: true });
+  assert.deepEqual(Object.keys(hub.gated_imports).sort(), ["cardinal", "claude_ai_hub_web_delivery"]);
 });
 
 // 经本地代理 CONNECT 一条隧道，返回已收到 200 的 socket。

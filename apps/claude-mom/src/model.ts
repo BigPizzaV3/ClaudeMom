@@ -44,8 +44,12 @@ export type ClaudeConfig = {
   forceBackgroundMode?: boolean;
   /** 打开 Cowork 的总开关（默认开）。 */
   cowork?: boolean;
-  /** 实验性：页面外壳用本机 Claude 自带的版本（默认关）。 */
-  localShell?: boolean;
+  /** 用 Claude 的合并式主页：对话和 Cowork 合在一起，没有「对话 | Cowork」切换（默认关）。 */
+  hubHome?: boolean;
+  /** 录制版用哪个录制版本（前端 build id）；空 = 最新。 */
+  template?: string;
+  /** 界面选「本机版」：用 Claude 自己的第三方模式启动（安装包自带的新界面，推理走本地服务；默认录制版）。 */
+  threePMode?: boolean;
   displayName?: string;
   email?: string;
   plan?: string;
@@ -71,6 +75,8 @@ export type ClaudeStatus = {
   caTrusted: boolean;
   caMachineSupported: boolean;
   caMachineTrusted: boolean;
+  /** 内嵌的录制版本，新的在前。builtAt 是该版本前端的构建时间（秒）。 */
+  templates?: Array<{ build: string; builtAt: number | null }>;
   nodeAvailable: boolean;
   dictationReady: boolean;
   config: ClaudeConfig;
@@ -152,7 +158,8 @@ export function setupSteps(status: ClaudeStatus | null, active: UpstreamProfile 
   const steps: Array<{ id: "upstream" | "node" | "trust"; text: string }> = [];
   if (!active || profileProblem(active)) steps.push({ id: "upstream", text: "先添加一组上游并选好默认模型" });
   if (!status.nodeAvailable) steps.push({ id: "node", text: "需要 Node.js（支持 fetch 与 WebSocket 的版本）" });
-  if (!status.caTrusted) steps.push({ id: "trust", text: "首次使用需要信任本地证书" });
+  // 第三方模式下 Claude 不经代理，不需要信任本地证书。
+  if (!status.caTrusted && !status.config.threePMode) steps.push({ id: "trust", text: "首次使用需要信任本地证书" });
   return steps;
 }
 
@@ -171,4 +178,12 @@ export function formatWindow(value: number | null | undefined): string {
 
 export function isOk(result: { status: CommandStatus }): boolean {
   return result.status === "ok";
+}
+
+/** 录制版本的显示：前端构建日期 + build id，例如「2026-11-14 · a4ced7f85b」。 */
+export function templateLabel(template: { build: string; builtAt: number | null }): string {
+  if (!template.builtAt) return template.build;
+  const date = new Date(template.builtAt * 1000);
+  const day = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+  return `${day} · ${template.build}`;
 }

@@ -24,8 +24,9 @@ Claude 安装包。代理、证书、缓存和会话数据由 Codex++ 放在独�
 | `CLAUDE_LOCAL_STATE_FILE` | 会话和通知设置文件；原子写入、权限为 `0600` |
 | `CLAUDE_LOCAL_READY_FILE` / `_INSTANCE_ID` | 本次启动的就绪回执和实例标识 |
 | `CLAUDE_LOCAL_LOCALIZATION` / `_VOICE_INPUT` / `_COMPUTER_USE` / `_BACKGROUND_MODE` / `_FORCE_BACKGROUND_MODE` | 各能力的独立开关，`0` 关闭、`1` 开启；最后一个无视后台模式的 macOS 版本上限 |
-| `CLAUDE_LOCAL_LOCAL_SHELL` | 实验性，只认 `1`：有模板时页面外壳也用本机 Claude 自带的版本。模板数据配的是线上页面，目前会缺汉化、账号显示和会话列表 |
 | `CLAUDE_LOCAL_COWORK` | Cowork 总开关（GrowthBook `yukon_silver`），默认开，`0` 时按录制模板里 Claude 自己的值 |
+| `CLAUDE_LOCAL_TEMPLATE` | 录制版用哪个录制版本（`mock/<build>/` 的目录名，即前端 build id）；不设或已下架时用最新的（按页面外壳的 `data-build-timestamp`） |
+| `CLAUDE_LOCAL_HUB_HOME` | 只认 `1`：用 Claude 的合并式主页（GrowthBook `claude_ai_hub_web_delivery`，对话和 Cowork 合在一个输入框里）。默认用有「对话 \| Cowork」切换的经典主页：关掉这个开关，并从 `gated_imports` 里去掉它的代码 |
 
 受管启动支持 `--port 0`，监听后写入
 `{instanceId,pid,port,mode,lastClientAt}` 回执，不包含网关凭据。
@@ -444,3 +445,20 @@ MFA 仅提供本地模拟账号的 GET 状态，不修改真实账号的双重�
 不修改用户 `chicagoPreferredMode`，当前选中的“后台/完全控制”仍由用户决定。
 真实 Claude.app 刷新后，后台选项由禁用恢复为可选，并显示已选中“后台”；
 辅助功能和屏幕录制仍显示已授予。未通过此检查执行实际后台操作。
+
+## 录制版本（mock-templates/）
+
+录制版界面的数据按前端版本分目录：`mock-templates/<build>/` 里是脱敏后的 `bootstrap.json`、`api/*.json`
+和同一次录制的页面外壳 `shell.html`。目录名必须等于前端 build id（测试会校验）。`build.rs` 把每个目录
+都内嵌进程序，安装到 `<state>/claude-local/mock/<build>/`；用户在设置 → 界面 → 版本里选，默认最新。
+前端代码（JS/CSS 等）不打包，使用时由本地服务从 `assets-proxy.anthropic.com` 下载并缓存。
+
+加一个新版本（需要能登录 claude.ai 的账号，录一次所有用户都能用）：
+
+1. `open -na "Google Chrome" --args --user-data-dir=<临时目录> --remote-debugging-port=9447 https://claude.ai/login`，登录。
+2. `node scripts/record-template.mjs --cdp http://127.0.0.1:9447 --out <私有目录>`
+3. `node sanitize-mock.mjs <私有目录>/mock` → 写到 `mock-templates/<build>/`
+4. 检查没有残留个人信息（`cargo test -p claude-local embedded_mock_template_is_sanitized` 会查邮箱，再人工核对
+   账号 uuid、组织名），实测后提交。录制目录和临时 Chrome profile 用完删掉。
+
+旧版本保留，太旧或用不了的直接删目录。

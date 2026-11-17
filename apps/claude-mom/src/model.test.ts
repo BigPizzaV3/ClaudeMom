@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { claudeState, emptyProfile, formatWindow, hostOf, normalizeModels, profileProblem, setupSteps, type ClaudeStatus } from "./model.ts";
+import { claudeState, emptyProfile, formatWindow, hostOf, normalizeModels, profileProblem, setupSteps, templateLabel, type ClaudeStatus } from "./model.ts";
 
 const status = (patch: Partial<ClaudeStatus> = {}): ClaudeStatus => ({
   supported: true, sourceApp: "", version: "1.0", claudeRunning: false, running: false, connected: false,
@@ -38,6 +38,8 @@ test("启动前清单按顺序列出缺的步骤", () => {
   const ready = { ...emptyProfile(), baseUrl: "https://a.example", model: "m" };
   assert.deepEqual(setupSteps(status(), ready), []);
   assert.deepEqual(setupSteps(status({ caTrusted: false, nodeAvailable: false }), null).map((step) => step.id), ["upstream", "node", "trust"]);
+  // 第三方模式不经代理：不要求信任证书。
+  assert.deepEqual(setupSteps(status({ caTrusted: false, config: { ...status().config, threePMode: true } }), null).map((step) => step.id), ["upstream"]);
 });
 
 test("窗口显示", () => {
@@ -54,4 +56,10 @@ test("前端调用的命令都在后端注册了", () => {
   const called = new Set([...app.matchAll(/"(claude_(?:mom|local)_[a-z_]+)"/g)].map((match) => match[1]));
   assert.ok(called.size >= 9, [...called].join(","));
   for (const command of called) assert.ok(new RegExp(`::${command},`).test(lib), `${command} 没有注册`);
+});
+
+test("recorded template versions are labelled by build date and id", () => {
+  const label = templateLabel({ build: "a4ced7f85b", builtAt: 1794603257 });
+  assert.match(label, /^2026-11-1[34] · a4ced7f85b$/);
+  assert.equal(templateLabel({ build: "x1", builtAt: null }), "x1");
 });
