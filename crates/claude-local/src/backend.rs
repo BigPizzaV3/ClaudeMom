@@ -537,10 +537,19 @@ fn apply_egress_proxy_config(sets: &[ProfileSet], port: u16) -> Result<()> {
             );
             continue;
         }
-        fs::create_dir_all(&library)
-            .with_context(|| format!("无法创建 {}", library.display()))?;
-        crate::fsutil::atomic_write(&library.join("_meta.json"), &meta)?;
-        crate::fsutil::atomic_write(&library.join(format!("{EGRESS_CONFIG_ID}.json")), &entry)?;
+        let created = !library.exists();
+        let result = (|| -> Result<()> {
+            fs::create_dir_all(&library)
+                .with_context(|| format!("无法创建 {}", library.display()))?;
+            // 先写配置，最后写带标记的 meta：meta 是「写完了」的标志。
+            crate::fsutil::atomic_write(&library.join(format!("{EGRESS_CONFIG_ID}.json")), &entry)?;
+            crate::fsutil::atomic_write(&library.join("_meta.json"), &meta)?;
+            Ok(())
+        })();
+        if result.is_err() && created {
+            let _ = fs::remove_dir_all(&library);
+        }
+        result?;
     }
     Ok(())
 }
@@ -1319,10 +1328,7 @@ fn untrust_ca(root: &Path) -> Result<()> {
     // certutil -delstore 同样会弹确认框，给足用户点确认的时间。
     #[cfg(windows)]
     {
-        let Some(thumbprint) = fs::read(&cert)
-            .ok()
-            .and_then(|pem| ca_thumbprint(&pem))
-        else {
+        let Some(thumbprint) = ca_thumbprint_from_root(root) else {
             bail!("无法读取本地证书指纹，无法取消信任");
         };
         if ca_trusted_user(root) {
@@ -2170,7 +2176,9 @@ pub fn stop_backend() {
 /// 应用退出时停止本地代理并清理临时写入的 egressProxyUrl 策略。
 pub fn shutdown_on_exit() {
     stop_backend();
-    let _ = remove_managed_egress_config_libraries(&profile_sets());
+    if let Ok(_guard) = OPERATION.try_lock() {
+        let _ = remove_managed_egress_config_libraries(&profile_sets());
+    }
 }
 
 /// 先礼后兵地结束一个子进程。

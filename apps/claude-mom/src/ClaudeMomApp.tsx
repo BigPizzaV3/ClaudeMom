@@ -677,7 +677,7 @@ function ClaudeSettings({ status, busy, onConfigure, onAction, onVoice, update, 
       <details className="cm-more">
         <summary>高级</summary>
         <Toggle checked={config.cowork ?? true} detail="关掉后按 Claude 自己的开关，新版 Claude 通常只剩 Chat / Code。系统条件（Windows 需商店版、虚拟化可用）仍由 Claude 检查" disabled={disabled} label="Cowork" onChange={(next) => onConfigure({ cowork: next })} />
-        {config.cowork && status.caMachineSupported && !status.caMachineTrusted ? (
+        {(config.cowork ?? true) && status.caMachineSupported && !status.caMachineTrusted ? (
           <div className="cm-row-actions" title="Cowork 虚拟机服务以 LocalSystem 运行，只读取本机根证书。">
             <span className="cm-field-hint cm-grow">Cowork 虚拟机需要系统级根证书（需管理员授权）。</span>
             <button className="cm-btn cm-btn-small" disabled={busy !== null} onClick={() => onAction("trust_machine")} type="button"><ShieldCheck />安装系统证书</button>
