@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
 import { decode, get, asMsg, asStr, ld, vi } from "./rpc.mjs";
 import { createOfficialAssets } from "./official-assets.mjs";
-import { createGatewayStreamParser, createStateStore, dropUnroutedModels, gatewayHttpError, isPrivateFile, gatewayModel, gatewayTarget, modelLabel, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
+import { createGatewayStreamParser, createStateStore, dropUnroutedModels, gatewayHttpError, isPrivateFile, gatewayModel, gatewayTarget, mergePoolModels, modelLabel, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const modelIds = ["alpha/claude-opus-4-6", "beta/gpt-6", "gamma/grok-4", "alpha/shared", "beta/shared"];
@@ -1179,6 +1179,75 @@ test("native bootstrap models without a provider are dropped from every picker l
   assert.equal(bootstrap.model_selector_config[1].models, undefined);
   // growthbook 不动
   assert.deepEqual(bootstrap.org_growthbook.features.list.defaultValue.models, growthbookModels);
+});
+
+test("provider models do not inherit the recorded template's plan gates", () => {
+  const ids = ["DeepSeek-V4.1-Flash", "DeepSeek-V4-Pro"];
+  const config = runtimeConfig({
+    CLAUDE_LOCAL_MANAGED: "1", CLAUDE_LOCAL_GATEWAY_URL: "https://localhost/gw/test/",
+    CLAUDE_LOCAL_GATEWAY_MODEL: ids[0], CLAUDE_LOCAL_GATEWAY_KEY: "test",
+    CLAUDE_LOCAL_GATEWAY_MODELS: JSON.stringify(ids),
+    // 保留模板里的原生模型，同时验证已有池内条目也会去掉限制
+    CLAUDE_LOCAL_HIDE_UNROUTED_MODELS: "0",
+    CLAUDE_LOCAL_GATEWAY_MODEL_NAMES: JSON.stringify({
+      [ids[0]]: { name: "DeepSeek V4.1 Flash", description: "DeepSeek" },
+      [ids[1]]: { name: "DeepSeek V4 Pro", description: "DeepSeek" },
+    }),
+  });
+  // 录制模板的第一项：Pro 机型，选择器靠这些字段显示「Pro」徽章和「升级」按钮。
+  const native = {
+    id: "claude-fable-5-2", name: "Fable 5.2",
+    disabled: true,
+    disabled_reason: { type: "upgrade_required", required_plan: "pro" },
+    selection_notice: { cta: { copy: "升级", intent: "upgrade" } },
+    badge: { message: "Pro、Max 或 Ultra" },
+    notice: { text: "Fable 消耗限额更快" },
+    notice_text: "Fable 消耗限额更快",
+    tooltip: { content: "包含在 Max 和 Ultra 套餐中" },
+    min_claude_code_version: "2.1.290",
+  };
+  const bootstrap = {
+    activeOrganization: {
+      claude_ai_bootstrap_models_config: [
+        { ...native, model: native.id, inactive: true },
+        { model: ids[1], inactive: true, notice_text: "旧模型", hard_limit: 1 },
+      ],
+    },
+    claude_ai_available_models: { models: [] },
+    model_selector_config: [{
+      id: "chat",
+      models: [{ ...native }, { id: ids[1], disabled: true, disabled_reason: { type: "upgrade_required" } }],
+    }],
+    model_selector_state: [{ id: "chat", model: "claude-fable-5-2" }],
+  };
+  mergePoolModels(bootstrap, config);
+
+  const selector = bootstrap.model_selector_config[0].models;
+  const flash = selector.find((m) => m.id === ids[0]);
+  assert.equal(flash.name, "DeepSeek V4.1 Flash");
+  assert.equal(flash.description, "DeepSeek");
+  assert.equal(flash.disabled, false);
+  assert.equal(flash.disabled_reason, null);
+  for (const key of ["badge", "selection_notice", "notice", "notice_text", "tooltip", "inactive", "min_claude_code_version"]) {
+    assert.equal(key in flash, false, `injected model must not carry ${key}`);
+  }
+  // 已经在选择器里、且路由得到的条目同样去掉限制
+  const pro = selector.find((m) => m.id === ids[1]);
+  assert.equal(pro.disabled, false);
+  assert.equal(pro.disabled_reason, null);
+  assert.equal("selection_notice" in pro, false);
+  // 路由不到的原生模型保留录制时的限制
+  assert.equal(selector.find((m) => m.id === "claude-fable-5-2").disabled, true);
+
+  const cfg = bootstrap.activeOrganization.claude_ai_bootstrap_models_config;
+  assert.deepEqual(cfg.map((m) => m.model), ["claude-fable-5-2", ids[1], ids[0]]);
+  for (const entry of cfg.filter((m) => ids.includes(m.model))) {
+    assert.equal("inactive" in entry, false);
+    assert.equal("notice_text" in entry, false);
+  }
+  assert.deepEqual(bootstrap.claude_ai_available_models.models, ids.map((id) => ({ model_id: id, minimum_tier: "free" })));
+  assert.equal(bootstrap.model_selector_state[0].model, ids[0]);
+  assert.deepEqual(bootstrap.model_selector_state[0].thinking_by_model.map((m) => m.id), ids);
 });
 
 test("recorded data dir opts managed mode into the PoC data path", () => {

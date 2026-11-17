@@ -323,6 +323,101 @@ export function dropUnroutedModels(bootstrap, config) {
   }
 }
 
+// 录制模板里第一项通常是被套餐限制的原生模型，带着这组字段：disabled /
+// disabled_reason（upgrade_required）/ selection_notice（CTA「升级」）/ badge
+// （「Pro、Max 或 Ultra」）。池内模型已经全部可用，这些限制不该跟着模板复制，
+// 否则选择器里每个上游模型都显示「升级」，点它只会打开订阅页。
+const MODEL_GATE_KEYS = [
+  "badge", "disabled", "disabled_reason", "selection_notice",
+  "notice", "notice_text", "tooltip", "inactive", "min_claude_code_version",
+];
+
+function clearModelGates(entry) {
+  for (const key of MODEL_GATE_KEYS) delete entry[key];
+  return entry;
+}
+
+/**
+ * 把网关池模型并入录制 bootstrap 的模型清单（就地修改）。
+ *
+ * 原生条目先拿来当新条目的模板；模板里的套餐限制先用 `clearModelGates`
+ * 摘掉，名称与副标题用池里的友好名。`hideUnroutedModels`（默认开）时
+ * 最后把池外条目删掉，选择器里只剩 provider/model 条目。
+ */
+export function mergePoolModels(bootstrap, config) {
+  const ids = config.models;
+  if (!isRecord(bootstrap) || !ids.length) return;
+  const label = (id) => modelLabel(config, id);
+  const cfg = bootstrap.activeOrganization?.claude_ai_bootstrap_models_config;
+  if (Array.isArray(cfg)) {
+    const seen = new Set(cfg.map((m) => m?.model));
+    const tpl = cfg[0] ?? {};
+    for (const entry of cfg) {
+      if (!isRecord(entry) || !ids.includes(entry.model)) continue;
+      clearModelGates(entry);
+      entry.hard_limit = modelWindow(config, entry.model);
+      entry.context_window = modelWindow(config, entry.model);
+    }
+    for (const id of ids) {
+      if (!seen.has(id)) cfg.push(clearModelGates({
+        ...tpl,
+        model: id,
+        name: label(id).name,
+        description: label(id).description || id,
+        hard_limit: modelWindow(config, id),
+        context_window: modelWindow(config, id),
+      }));
+    }
+  }
+  const avail = bootstrap.claude_ai_available_models?.models;
+  if (Array.isArray(avail)) {
+    const seen = new Set(avail.map((m) => m?.model_id));
+    for (const id of ids) {
+      if (!seen.has(id)) avail.push({ model_id: id, minimum_tier: "free" });
+    }
+  }
+  if (Array.isArray(bootstrap.model_selector_config)) {
+    for (const sel of bootstrap.model_selector_config) {
+      if (!Array.isArray(sel?.models)) continue;
+      const seen = new Set(sel.models.map((m) => m?.id));
+      const tpl = sel.models[0] ?? {};
+      for (const entry of sel.models) {
+        if (!isRecord(entry) || !ids.includes(entry.id)) continue;
+        clearModelGates(entry);
+        entry.disabled = false;
+        entry.disabled_reason = null;
+        entry.hard_limit = modelWindow(config, entry.id);
+        entry.context_window = modelWindow(config, entry.id);
+        entry.runtime = { max_input_tokens: modelWindow(config, entry.id) };
+      }
+      for (const id of ids) {
+        if (seen.has(id)) continue;
+        const entry = clearModelGates({
+          ...tpl,
+          id,
+          name: label(id).name,
+          short_name: label(id).name,
+          description: label(id).description || id,
+          hard_limit: modelWindow(config, id),
+          context_window: modelWindow(config, id),
+          runtime: { max_input_tokens: modelWindow(config, id) },
+        });
+        // 清掉模板的限制后再补上明确的「可用」，与 modelSelectors() 生成的条目一致。
+        entry.disabled = false;
+        entry.disabled_reason = null;
+        sel.models.push(entry);
+      }
+    }
+  }
+  if (Array.isArray(bootstrap.model_selector_state)) {
+    const thinking = { type: "effort", effort: "medium" };
+    bootstrap.model_selector_state = bootstrap.model_selector_state.map((s) => s && typeof s === "object"
+      ? { ...s, model: config.model, thinking_by_model: ids.map((id) => ({ id, thinking })) }
+      : s);
+  }
+  if (config.hideUnroutedModels) dropUnroutedModels(bootstrap, config);
+}
+
 /** 选择器里的名称与副标题：有友好名用友好名（副标题是供应商），否则名称沿用模型 id、副标题为空。 */
 export function modelLabel(config, id) {
   const entry = config.modelNames?.[id];
