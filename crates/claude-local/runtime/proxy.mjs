@@ -796,13 +796,21 @@ function restTime(value, fallback) {
  * 两边都要能读出来，否则从另一条路径建的会话打开就是空的。
  */
 function restMessages(c) {
-  if (c.chat_messages?.length) return c.chat_messages;
+  // 旧版本存的 chat_messages 缺 11-17 前端要的数组字段：原样回传会渲染崩，
+  // 每条都补齐缺省数组（已有字段一律保留）。
+  const withArrays = (m) => ({
+    files: [], files_v2: [], attachments: [], sync_sources: [], ...m,
+  });
+  if (c.chat_messages?.length) return c.chat_messages.map(withArrays);
   const messages = [];
   for (const turn of c.turns || []) {
     const created = restTime(turn.created, c.created_at);
+    // 11-17 起的前端对消息里的数组字段直接 .some()/.map()：缺了就是
+    // "Cannot read properties of undefined (reading 'some')" → 两条「无法加载此内容」。
     const entry = (uuid, sender, index, parent, text, extra = {}) => ({
       uuid, sender, index, parent_message_uuid: parent ?? null, text,
       content: [{ type: "text", text, citations: [] }],
+      files: [], files_v2: [], attachments: [], sync_sources: [],
       created_at: created, updated_at: created, ...extra,
     });
     messages.push(entry(turn.humanId, "human", turn.humanIndex, turn.humanParent, turn.prompt || ""));
@@ -825,6 +833,11 @@ function convToRest(c, { messages = false } = {}) {
   const live = c.turns?.some((t) => !t.complete);
   const title = c.name && c.name !== "New conversation" ? c.name : "";
   return {
+    // 录制数据里 conversations.data 是空的 → REST_CONV_TEMPLATE={}，新版前端
+    // 读不到约定数组字段就 undefined.some()。先给一层官方形状的默认值，再让
+    // 模板（有数据时）和动态字段覆盖。
+    settings: {}, project_uuid: null, is_starred: false, is_archived: false,
+    files: [], sync_sources: [],
     ...REST_CONV_TEMPLATE,
     uuid: c.uuid,
     id: c.uuid,
@@ -1174,7 +1187,12 @@ function mockApi(req, res, url) {
   if (/\/marketplaces\//.test(p)) {
     return json(res, { ...pageShape, marketplaces: [] });
   }
+  // /api/frame/types 前端校验必须是 200 + types 数组，否则反复报
+  // "frame type catalog 200 without a types list"（issue #26）。
+  if (p.startsWith("/api/frame/types")) return json(res, { ...pageShape, types: [] });
   if (p.startsWith("/api/frame/")) return json(res, pageShape);
+  // 插件注册表：前端按 {data: [...]} 校验，回 {} 会把整个插件页打崩（issue #25/#26）。
+  if (/\/plugins\/registry/.test(p)) return json(res, { data: [] });
   // 客户端按 plugin id 读取元数据字典，每个值都必须是对象。
   if (p.endsWith("/cowork_plugin_metadata")) return json(res, {});
 
