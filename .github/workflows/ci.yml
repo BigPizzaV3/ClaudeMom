@@ -43,7 +43,7 @@ jobs:
         working-directory: crates/claude-local/runtime
         run: |
           bash scripts/gen-ca.sh
-          node --test --test-timeout=120000 managed.test.mjs proxy.test.mjs scripts/*.test.mjs
+          node --test --test-timeout=120000 managed.test.mjs proxy.test.mjs cowork-prompt.test.mjs scripts/*.test.mjs
 
       - name: release 编译
         run: cargo build --release -p claude-mom
