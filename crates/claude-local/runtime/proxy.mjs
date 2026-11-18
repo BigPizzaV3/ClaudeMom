@@ -1822,7 +1822,7 @@ class UpstreamTunnelAgent extends https.Agent {
     // 请求方先放弃（TLS 连接被销毁）时，没打通的 CONNECT 一并取消。
     tunnel.once("close", () => connect.destroy());
     connect.end();
-    return tls.connect({ socket: tunnel, servername: options.servername || host });
+    return tls.connect({ socket: tunnel, servername: options.servername || host, rejectUnauthorized: options.rejectUnauthorized });
   }
 }
 
@@ -1834,6 +1834,35 @@ function upstreamRequest(target, options, callback) {
   if (target.protocol !== "https:") return http.request(options, callback);
   const viaProxy = tunnelAgent && !isLoopbackHost(target.hostname);
   return https.request({ ...options, agent: viaProxy ? tunnelAgent : directAgent }, callback);
+}
+
+// 回源 TLS 证书校验失败（Clash/VPN 节点、企业中间盒重签证书等）时的兜底重试池。
+// Node 只用自己内置的 CA 列表，不读系统钥匙串：被重签时 openssl/curl 能过、Node 直接
+// UNABLE_TO_*。回源拉的只是公开静态资源和页面外壳（不含 /v1/messages 模型流量——那走
+// forwardGateway），校验失败时放宽验证重试一次，比整机 502 强；代价是这一路对真 MITM 开放，
+// 所以只在严格校验失败之后降级，并打日志。
+const directInsecureAgent = new https.Agent({ ...UPSTREAM_POOL, rejectUnauthorized: false });
+const tunnelInsecureAgent = UPSTREAM_PROXY ? new UpstreamTunnelAgent(UPSTREAM_POOL) : null;
+
+function insecureUpstreamRequest(target, options, callback) {
+  if (target.protocol !== "https:") return http.request(options, callback);
+  const viaProxy = tunnelInsecureAgent && !isLoopbackHost(target.hostname);
+  return https.request({
+    ...options,
+    rejectUnauthorized: false,
+    agent: viaProxy ? tunnelInsecureAgent : directInsecureAgent,
+  }, callback);
+}
+
+function isTlsVerifyError(err) {
+  return typeof err?.code === "string" && (
+    err.code.startsWith("UNABLE_TO_") ||
+    err.code.startsWith("ERR_TLS_") ||
+    ["CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT", "SELF_SIGNED_CERT_IN_CHAIN",
+     "CERT_UNTRUSTED", "CERT_CHAIN_TOO_LONG", "INVALID_CA", "CERT_NOT_YET_VALID",
+     "HOSTNAME_MISMATCH", "UNABLE_TO_GET_ISSUER_CERT", "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+     "UNABLE_TO_DECRYPT_CERT_SIGNATURE", "UNABLE_TO_DECODE_ISSUER_PUBLIC_KEY"].includes(err.code)
+  );
 }
 
 function proxyUpstream(req, res, url) {
@@ -1854,79 +1883,97 @@ function proxyUpstream(req, res, url) {
   delete headers.connection;
   delete headers["keep-alive"];
 
-  const upstreamReq = upstreamRequest(
-    target,
-    {
-      hostname: target.hostname,
-      port: target.port || 443,
-      path: target.pathname + target.search,
-      method: req.method,
-      headers,
-      timeout: 20000,
-    },
-    (up) => {
-      if (!canCache) {
-        // 边收边转：Claude Code 安装包（上百 MB）、Cowork 虚拟机镜像（GB 级）以前要整个读进内存才开始回，
-        // 下载器在这段时间收不到一个字节，空闲超时（IDLE_TIMEOUT）就放弃了。
-        res.writeHead(up.statusCode, streamedResponseHeaders(up.headers));
-        up.pipe(res);
-        res.on("close", () => { if (!up.complete) upstreamReq.destroy(); });
-        up.on("close", () => { if (!up.complete) res.destroy(); });
-        return;
-      }
-      // 要缓存的只有带哈希的静态资源和页面，都不大：收齐再回，和之后从缓存回放的字节、长度一致。
-      const chunks = [];
-      up.on("data", (c) => chunks.push(c));
-      up.on("end", () => {
-        const body = Buffer.concat(chunks);
-        const ok = up.statusCode >= 200 && up.statusCode < 400;
-        // 文档路由不缓存桩体/落地页 HTML（登出页会让 SPA 卡骨架屏）
-        const docStub = isDocNav(req, url) && body.length < 4096;
-        if (ok && !docStub && (!staticAsset || (
-          up.statusCode === 200 && !up.headers["set-cookie"] &&
-          !/\b(?:private|no-store)\b/i.test(String(up.headers["cache-control"] || ""))
-        ))) {
-          fs.mkdirSync(path.dirname(cp), { recursive: true });
-          fs.writeFileSync(cp, body);
-          fs.writeFileSync(
-            metaPath,
-            JSON.stringify({ status: up.statusCode, headers: bufferedResponseHeaders(up.headers, body.length), url: cacheKey }),
-          );
+  // TLS 证书校验失败要能用放宽校验重试一次：重试需要可重放的请求体，先收齐再发；
+  // req 的 body 只能读一次，收齐后两次 send 共用同一份。
+  // 上行体本来就不大（回源没有大文件上传），收齐再发不改变行为。
+  const send = (body, insecure) => {
+    const requestOnce = insecure ? insecureUpstreamRequest : upstreamRequest;
+    const upstreamReq = requestOnce(
+      target,
+      {
+        hostname: target.hostname,
+        port: target.port || 443,
+        path: target.pathname + target.search,
+        method: req.method,
+        headers,
+        timeout: 20000,
+      },
+      (up) => {
+        if (!canCache) {
+          // 边收边转：Claude Code 安装包（上百 MB）、Cowork 虚拟机镜像（GB 级）以前要整个读进内存才开始回，
+          // 下载器在这段时间收不到一个字节，空闲超时（IDLE_TIMEOUT）就放弃了。
+          res.writeHead(up.statusCode, streamedResponseHeaders(up.headers));
+          up.pipe(res);
+          res.on("close", () => { if (!up.complete) upstreamReq.destroy(); });
+          up.on("close", () => { if (!up.complete) res.destroy(); });
+          return;
         }
-        res.writeHead(up.statusCode, bufferedResponseHeaders(up.headers, body.length));
-        res.end(body);
-      });
-    },
-  );
-  upstreamReq.on("timeout", () => upstreamReq.destroy(new Error("upstream timeout")));
-  upstreamReq.on("error", (err) => {
-    if (res.headersSent) {
-      // 已经开始转发了，没法再换成兜底响应；断开让客户端知道没收全。
-      log(`UPSTREAM FAIL ${url.pathname} (mid-stream): ${err.message}`);
-      return res.destroy();
-    }
-    if (serveCachedStaticAsset(req, res, url)) return;
-    // 动态接口不能回放其它会话的缓存；文档仍沿用本地外壳兜底。
-    if (canCache && document && fs.existsSync(cp) && fs.existsSync(metaPath)) {
-      const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
-      const body = fs.readFileSync(cp);
-      const docStub = isDocNav(req, url) && (meta.status !== 200 || body.length < 4096);
-      if (docStub) {
-        // 桩体不落回客户端；真外壳兜底已在上层分支兜底
-        res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
-        res.end("upstream unavailable (doc stub suppressed)\n");
+        // 要缓存的只有带哈希的静态资源和页面，都不大：收齐再回，和之后从缓存回放的字节、长度一致。
+        const chunks = [];
+        up.on("data", (c) => chunks.push(c));
+        up.on("end", () => {
+          const body = Buffer.concat(chunks);
+          const ok = up.statusCode >= 200 && up.statusCode < 400;
+          // 文档路由不缓存桩体/落地页 HTML（登出页会让 SPA 卡骨架屏）
+          const docStub = isDocNav(req, url) && body.length < 4096;
+          if (ok && !docStub && (!staticAsset || (
+            up.statusCode === 200 && !up.headers["set-cookie"] &&
+            !/\b(?:private|no-store)\b/i.test(String(up.headers["cache-control"] || ""))
+          ))) {
+            fs.mkdirSync(path.dirname(cp), { recursive: true });
+            fs.writeFileSync(cp, body);
+            fs.writeFileSync(
+              metaPath,
+              JSON.stringify({ status: up.statusCode, headers: bufferedResponseHeaders(up.headers, body.length), url: cacheKey }),
+            );
+          }
+          res.writeHead(up.statusCode, bufferedResponseHeaders(up.headers, body.length));
+          res.end(body);
+        });
+      },
+    );
+    upstreamReq.on("timeout", () => upstreamReq.destroy(new Error("upstream timeout")));
+    upstreamReq.on("error", (err) => {
+      if (!insecure && !res.headersSent && isTlsVerifyError(err)) {
+        // Node 不读系统钥匙串：VPN/代理节点或中间盒重签证书时严格校验必炸，
+        // 而 openssl/curl 没问题。回源内容（公开静态资源、页面外壳）不依赖证书身份，
+        // 放宽校验重试一次；/v1/messages 模型流量不走这条路，不受影响。
+        log(`UPSTREAM TLS VERIFY FAILED ${url.pathname}: ${err.message} — retrying without verification`);
+        send(body, true);
         return;
       }
-      res.writeHead(meta.status || 200, bufferedResponseHeaders(meta.headers, body.length));
-      res.end(body);
-      log(`CACHE HIT ${url.pathname}`);
-      return;
-    }
-    log(`UPSTREAM FAIL ${url.pathname}: ${err.message}`);
-    res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
-    res.end(`upstream unavailable: ${err.message}\n`);
-  });
-  req.pipe(upstreamReq);
+      if (res.headersSent) {
+        // 已经开始转发了，没法再换成兜底响应；断开让客户端知道没收全。
+        log(`UPSTREAM FAIL ${url.pathname} (mid-stream): ${err.message}`);
+        return res.destroy();
+      }
+      if (serveCachedStaticAsset(req, res, url)) return;
+      // 动态接口不能回放其它会话的缓存；文档仍沿用本地外壳兜底。
+      if (canCache && document && fs.existsSync(cp) && fs.existsSync(metaPath)) {
+        const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
+        const body = fs.readFileSync(cp);
+        const docStub = isDocNav(req, url) && (meta.status !== 200 || body.length < 4096);
+        if (docStub) {
+          // 桩体不落回客户端；真外壳兜底已在上层分支兜底
+          res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
+          res.end("upstream unavailable (doc stub suppressed)\n");
+          return;
+        }
+        res.writeHead(meta.status || 200, bufferedResponseHeaders(meta.headers, body.length));
+        res.end(body);
+        log(`CACHE HIT ${url.pathname}`);
+        return;
+      }
+      log(`UPSTREAM FAIL ${url.pathname}: ${err.message}`);
+      res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
+      res.end(`upstream unavailable: ${err.message}\n`);
+    });
+    // 缓冲后的实际字节数以 body 为准；沿用客户端的 content-length 会在
+    // 客户端早断时让上游一直等不齐的字节。
+    upstreamReq.setHeader("content-length", body.length);
+    upstreamReq.end(body);
+  };
+  readBody(req, (body) => send(body, false));
 }
 
 // ── 请求处理 ─────────────────────────────────────────────────

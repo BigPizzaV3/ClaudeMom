@@ -510,6 +510,38 @@ test("upstream fetches share a bounded, reused connection pool through the upstr
   }
 });
 
+test("upstream TLS verification failure falls back to an unverified retry", async () => {
+  // Clash/VPN 节点或企业中间盒重签证书时 Node 的内置 CA 不认（不读系统钥匙串），
+  // 回源请求一律 502。回源内容（公开静态资源、页面外壳）不依赖证书身份，
+  // 严格校验失败后用放宽校验的连接池重试一次。
+  const tlsServer = https.createServer({
+    key: fs.readFileSync(path.join(here, "ca/server.key")),
+    cert: fs.readFileSync(path.join(here, "ca/server.crt")),
+  }, (req, res) => {
+    res.writeHead(200, { "content-type": "text/javascript", "cache-control": "no-store" });
+    res.end(`// resigned ${req.url}`);
+  });
+  tlsServer.listen(0, "127.0.0.1");
+  await once(tlsServer, "listening");
+  const instance = await start({
+    CLAUDE_LOCAL_CACHE_DIR: path.join(root, "tls-fallback-cache"),
+    // 注意：不给 NODE_EXTRA_CA_CERTS——本地 CA 不在 Node 的信任列表里，
+    // 与被重签证书等效：严格校验必失败，走放宽重试。
+    CLAUDE_LOCAL_UPSTREAM_MAP: JSON.stringify({
+      "assets-proxy.anthropic.com": `https://127.0.0.1:${tlsServer.address().port}`,
+    }),
+  });
+  try {
+    const asset = await request(instance, "/claude-ai/v2/assets/v1/missing-asset-ABCDEFGH12.js", { host: "assets-proxy.anthropic.com" });
+    assert.equal(asset.status, 200, `严格校验失败后放宽重试应拿到资源，实得 ${asset.status}: ${asset.bytes.toString("utf8").slice(0, 120)}`);
+    assert.equal(asset.bytes.toString("utf8"), "// resigned /claude-ai/v2/assets/v1/missing-asset-ABCDEFGH12.js");
+  } finally {
+    await stop(instance);
+    tlsServer.closeAllConnections();
+    tlsServer.close();
+  }
+});
+
 test("unpacked ion-dist directory is served when the Claude build ships no ASAR", async () => {
   // 部分 Claude 版本把前端解包成 resources/ion-dist/，没有 ion-dist.asar（issue #5）。
   const resourcesDir = path.join(root, "unpacked-resources");
