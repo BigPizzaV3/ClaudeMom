@@ -223,6 +223,54 @@ function normalizeMember(pathname) {
   return member;
 }
 
+const COWORK_PROMPT_ANCHOR = Buffer.from("<application_details>\\nClaude is operating as an agent inside the Claude desktop app.");
+const MAX_APP_ARCHIVE_BYTES = 512 * 1024 * 1024;
+
+function unescapeTemplateLiteral(raw) {
+  return raw
+    .replace(/\\([\\`$])/g, "$1")
+    .replace(/\\n/g, "\n")
+    .replace(/\\r/g, "\r")
+    .replace(/\\t/g, "\t");
+}
+
+/**
+ * 官方桌面端在原生 3P bootstrap 里通过 system_prompts.cowork_system_prompt 下发 Cowork
+ * 的系统提示词。这里从本机 app.asar 里读出同一份文本，避免在开源仓库里重新分发官方文本。
+ * 找不到时返回空串，由调用方决定如何兜底。
+ */
+export function loadCoworkSystemPrompt(resourcesDir) {
+  if (!resourcesDir) return "";
+  try {
+    const realResources = fs.realpathSync(resourcesDir);
+    const archivePath = path.join(realResources, "app.asar");
+    const metadata = fs.lstatSync(archivePath);
+    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size < 24 || metadata.size > MAX_APP_ARCHIVE_BYTES) return "";
+    const source = fs.readFileSync(archivePath);
+    const anchor = source.indexOf(COWORK_PROMPT_ANCHOR);
+    if (anchor < 0) return "";
+    // 模板字面量以 t=` 开头，紧挨着 <application_details>；取它前面那个反引号。
+    const header = source.lastIndexOf(Buffer.from("<application_details>"), anchor);
+    const open = header < 0 ? -1 : source.lastIndexOf(0x60, header);
+    if (open < 0) return "";
+    let end = -1;
+    for (let index = open + 1; index < source.length; index += 1) {
+      if (source[index] !== 0x60) continue;
+      let slashes = 0;
+      for (let back = index - 1; back > open && source[back] === 0x5c; back -= 1) slashes += 1;
+      if (slashes % 2 === 0) {
+        end = index;
+        break;
+      }
+    }
+    if (end < 0) return "";
+    const prompt = unescapeTemplateLiteral(source.subarray(open + 1, end).toString("utf8")).trim();
+    return prompt.startsWith("<application_details>") ? prompt : "";
+  } catch {
+    return "";
+  }
+}
+
 export function createOfficialAssets(resourcesDir) {
   if (!resourcesDir) return null;
   const archive = openArchive(resourcesDir);

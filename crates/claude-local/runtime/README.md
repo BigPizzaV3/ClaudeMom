@@ -25,6 +25,7 @@ Claude 安装包。代理、证书、缓存和会话数据由 Codex++ 放在独�
 | `CLAUDE_LOCAL_READY_FILE` / `_INSTANCE_ID` | 本次启动的就绪回执和实例标识 |
 | `CLAUDE_LOCAL_LOCALIZATION` / `_VOICE_INPUT` / `_COMPUTER_USE` / `_BACKGROUND_MODE` / `_FORCE_BACKGROUND_MODE` | 各能力的独立开关，`0` 关闭、`1` 开启；最后一个无视后台模式的 macOS 版本上限 |
 | `CLAUDE_LOCAL_COWORK` | Cowork 总开关（GrowthBook `yukon_silver`），默认开，`0` 时按录制模板里 Claude 自己的值 |
+| `CLAUDE_LOCAL_COWORK_PROMPT_FILE` | 覆盖 Cowork 系统提示词的文件；不设时从本机 `app.asar` 读，读不到用内置兜底文案 |
 | `CLAUDE_LOCAL_TEMPLATE` | 录制版用哪个录制版本（`mock/<build>/` 的目录名，即前端 build id）；不设或已下架时用最新的（按页面外壳的 `data-build-timestamp`） |
 | `CLAUDE_LOCAL_HUB_HOME` | 只认 `1`：用 Claude 的合并式主页（GrowthBook `claude_ai_hub_web_delivery`，对话和 Cowork 合在一个输入框里）。默认用有「对话 \| Cowork」切换的经典主页：关掉这个开关，并从 `gated_imports` 里去掉它的代码 |
 
@@ -150,6 +151,7 @@ node scripts/patch-dictation-start.mjs --restore
 
 ```
 GET  /api/bootstrap
+GET  /api/bootstrap/:org/system_prompts   (Cowork 系统提示词；优先从本机 app.asar 读取)
 GET  /api/account
 GET  /api/organizations
 GET  /api/organizations/:org

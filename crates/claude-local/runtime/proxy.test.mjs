@@ -20,12 +20,14 @@ const gatewayRequests = [];
 const upstreamRequests = [];
 const cdnAssetPath = "/claude-ai/v2/assets/v1/codex-fixture-AbCd1234.js";
 const cdnAssetBody = gzipSync('export const fixture = "cached CDN bytes";');
+const coworkPromptFixture = "<application_details>\nClaude test agent.\n</application_details>";
 let gateway;
 let upstreamFixture;
 let upstreamFixturePort;
 let proxy;
 let proxyClosed;
 let proxyPort;
+let coworkPromptFile;
 let dictationFixture;
 let dictationFixturePort;
 let dictationStateDir;
@@ -234,6 +236,8 @@ async function openTlsUpgrade({
 
 before(async () => {
   dictationStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-local-dictation-"));
+  coworkPromptFile = path.join(os.tmpdir(), `claude-local-cowork-${process.pid}.txt`);
+  fs.writeFileSync(coworkPromptFile, coworkPromptFixture, { mode: 0o600 });
   dictationCacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-local-cache-"));
   const assetHost = "assets-proxy.anthropic.com";
   dictationAssetPath = "/claude-ai/v2/assets/v1/c342ae4ef-ROR3Yba4.js";
@@ -347,6 +351,7 @@ before(async () => {
         "assets-proxy.anthropic.com": `http://127.0.0.1:${upstreamFixturePort}`,
       }),
       CLAUDE_LOCAL_CACHE_DIR: dictationCacheDir,
+      CLAUDE_LOCAL_COWORK_PROMPT_FILE: coworkPromptFile,
       CODEX_PLUS_STATE_DIR: dictationStateDir,
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -380,6 +385,7 @@ after(async () => {
   }
   if (gateway) await new Promise((resolve) => gateway.close(resolve));
   if (dictationFixture) await new Promise((resolve) => dictationFixture.close(resolve));
+  if (coworkPromptFile) fs.unlinkSync(coworkPromptFile);
   if (dictationStateDir) {
     fs.unlinkSync(path.join(dictationStateDir, "dictation-helper.json"));
     fs.rmdirSync(dictationStateDir);
@@ -535,6 +541,17 @@ test("Desktop exposes the separate background-mode capability without selecting 
     enabled: true, appScopedEnabled: true,
   });
   assert.equal(result.body.chicagoPreferredMode, undefined);
+});
+
+test("mock mode serves the cowork system prompt through the bootstrap and its own endpoint", async () => {
+  const endpoint = await request("/api/bootstrap/00000000-0000-4000-8000-636c61756465/system_prompts", { host: "claude.ai" });
+  assert.equal(endpoint.status, 200);
+  assert.equal(endpoint.body.cowork_system_prompt.value.prompt, coworkPromptFixture);
+  assert.equal(endpoint.body.cowork_system_prompt.source, "defaultValue");
+
+  const bootstrap = await request("/api/bootstrap", { host: "claude.ai" });
+  assert.equal(bootstrap.status, 200);
+  assert.equal(bootstrap.body.system_prompts.cowork_system_prompt.value.prompt, coworkPromptFixture);
 });
 
 test("Desktop keeps its own macOS ceiling for background mode unless forced", async () => {
