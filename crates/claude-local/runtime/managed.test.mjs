@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
 import { decode, get, asMsg, asStr, ld, vi } from "./rpc.mjs";
 import { createOfficialAssets, loadCoworkSystemPrompt } from "./official-assets.mjs";
-import { createGatewayStreamParser, createStateStore, dropUnroutedModels, gatewayHttpError, isPrivateFile, gatewayModel, gatewayTarget, mergePoolModels, modelLabel, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
+import { createGatewayStreamParser, createStateStore, dropUnroutedModels, gatewayBody, gatewayHttpError, isPrivateFile, gatewayModel, gatewayTarget, mergePoolModels, modelLabel, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const modelIds = ["alpha/claude-opus-4-6", "beta/gpt-6", "gamma/grok-4", "alpha/shared", "beta/shared"];
@@ -1197,6 +1197,26 @@ test("gateway contracts keep duplicate model names distinct and old sessions use
   assert.equal(gatewayModel(config, undefined), modelIds[0]);
   assert.equal(gatewayModel(config, "claude-native-default"), modelIds[0]);
   assert.equal(gatewayModel(config, "claude-haiku-4-5"), modelIds[2]);
+});
+
+test("gateway aliases preserve the configured ID and only resolve unique window or namespace matches", () => {
+  const opus = "relay.anthropic.claude-opus[1m]";
+  const models = [opus, "relay/sonnet[128k]", "alpha/shared", "beta/shared", "shared[1m]",
+    "alpha/duplicate", "beta.duplicate[128k]", "relay/preview[beta]", "alpha/sized[128k]", "beta/sized[1m]"];
+  for (const pool of [models, [...models].reverse()]) {
+    const config = { managed: true, model: "default", smallModel: "small", models: pool };
+    for (const [requested, expected] of [
+      [opus, opus], ["relay.anthropic.claude-opus", opus], ["claude-opus", opus],
+      ["sonnet", "relay/sonnet[128k]"], ["shared", "shared[1m]"], ["alpha/shared", "alpha/shared"],
+      ["sized[1m]", "beta/sized[1m]"], ["sized[32k]", "default"], ["sized", "default"],
+      ["duplicate", "default"], ["preview", "default"], ["nus", "default"], ["claude-haiku-4", "small"],
+    ]) {
+      assert.equal(gatewayModel(config, requested), expected, requested);
+    }
+    const payload = gatewayBody(config, Buffer.from(JSON.stringify({ model: "claude-opus", messages: [] })));
+    assert.equal(JSON.parse(payload).model, opus);
+    assert.equal(gatewayModel({ ...config, managed: false }, "duplicate"), "duplicate");
+  }
 });
 
 test("native bootstrap models without a provider are dropped from every picker list", () => {

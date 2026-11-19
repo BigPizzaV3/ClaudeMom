@@ -170,7 +170,7 @@ const MAX_DICTATION_WS_DURATION_MS = 16 * 60_000;
 // compliance_taints 可选数组，defaults 可选对象。
 const POLICY_LIMITS = { restrictions: {}, compliance_taints: [], defaults: {}, artifact_create_notice: null };
 const DICTATION_ALLOWED_HOSTS = new Set(["claude.ai", "claude.com", "api.anthropic.com"]);
-const DICTATION_ALLOWED_ORIGINS = new Set(["https://claude.ai", "https://claude.com"]);
+const DESKTOP_WEB_ORIGINS = new Set(["https://claude.ai", "https://claude.com"]);
 let lastClientAt = null;
 let listeningPort = PORT;
 let persistenceWarning = null;
@@ -1909,6 +1909,21 @@ function upstreamRequest(target, options, callback) {
   return https.request({ ...options, agent: viaProxy ? tunnelAgent : directAgent }, callback);
 }
 
+function upstreamFailureHeaders(req) {
+  const result = {
+    "content-type": "text/plain; charset=utf-8",
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+    "vary": "Origin",
+  };
+  const origin = req.headers.origin;
+  if (DESKTOP_WEB_ORIGINS.has(origin)) {
+    result["access-control-allow-origin"] = origin;
+    result["access-control-allow-credentials"] = "true";
+  }
+  return result;
+}
+
 function proxyUpstream(req, res, url) {
   const cacheKey = `${url.host}${url.pathname}${url.search}`;
   const cp = cachePathFor(cacheKey);
@@ -1986,7 +2001,7 @@ function proxyUpstream(req, res, url) {
       const docStub = isDocNav(req, url) && (meta.status !== 200 || body.length < 4096);
       if (docStub) {
         // 桩体不落回客户端；真外壳兜底已在上层分支兜底
-        res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
+        res.writeHead(502, upstreamFailureHeaders(req));
         res.end("upstream unavailable (doc stub suppressed)\n");
         return;
       }
@@ -1996,7 +2011,7 @@ function proxyUpstream(req, res, url) {
       return;
     }
     log(`UPSTREAM FAIL ${url.pathname}: ${err.message}`);
-    res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
+    res.writeHead(502, upstreamFailureHeaders(req));
     res.end(`upstream unavailable: ${err.message}\n`);
   });
   req.pipe(upstreamReq);
@@ -2497,7 +2512,7 @@ function handleDictationUpgrade(req, clientSocket, head) {
       origin.pathname !== "/" ||
       origin.search ||
       origin.hash ||
-      !DICTATION_ALLOWED_ORIGINS.has(origin.origin)
+      !DESKTOP_WEB_ORIGINS.has(origin.origin)
     ) {
       return rejectUpgrade(clientSocket, "403 Forbidden", "forbidden");
     }

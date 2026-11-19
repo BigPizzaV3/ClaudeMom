@@ -340,6 +340,7 @@ before(async () => {
   // 假上游：记录代理转发过来的 host 头与路径
   upstreamFixture = http.createServer((req, res) => {
     upstreamRequests.push({ host: req.headers.host, url: req.url });
+    if (req.url === "/upstream-failure-fixture") return req.socket.destroy();
     if (req.url.startsWith("/stream-fixture/")) {
       // 先发一段就停住，等测试放行才发完：本地服务必须边收边转，不能等整包到齐。
       res.writeHead(200, { "content-type": "application/octet-stream", "content-length": streamFixtureSize });
@@ -736,6 +737,19 @@ test("upstream requests keep their original host instead of being rewritten to c
   const seen = upstreamRequests.at(-1);
   assert.equal(seen.host, "downloads.claude.ai");
   assert.equal(seen.url, "/claude-code-releases/2.1.317/darwin-arm64/claude.app.tar.zst");
+});
+
+test("only the Desktop web origins can read the proxy's upstream failures across origins", async () => {
+  for (const [origin, allowed] of [["https://claude.ai", true], ["https://claude.com", true],
+    ["https://example.org", false], ["https://claude.ai.example.org", false], ["null", false], [undefined, false]]) {
+    const failure = await requestText("assets-proxy.anthropic.com", "/upstream-failure-fixture", origin ? { origin } : {});
+    assert.equal(failure.status, 502);
+    assert.equal(failure.headers["access-control-allow-origin"], allowed ? origin : undefined);
+    assert.equal(failure.headers["access-control-allow-credentials"], allowed ? "true" : undefined);
+    assert.equal(failure.headers.vary.toLowerCase(), "origin");
+    assert.equal(failure.headers["cache-control"], "no-store");
+    assert.match(failure.body, /upstream unavailable/);
+  }
 });
 
 async function openDownload(host, pathname) {
