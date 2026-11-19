@@ -223,15 +223,30 @@ function normalizeMember(pathname) {
   return member;
 }
 
-const COWORK_PROMPT_ANCHOR = Buffer.from("<application_details>\\nClaude is operating as an agent inside the Claude desktop app.");
+const COWORK_PROMPT_ANCHOR = Buffer.from("`<application_details>\\nClaude is operating as an agent inside the Claude desktop app.");
 const MAX_APP_ARCHIVE_BYTES = 512 * 1024 * 1024;
+const MAX_PROMPT_BYTES = 256 * 1024;
+const TEMPLATE_ESCAPES = { n: "\n", r: "\r", t: "\t", b: "\b", f: "\f", v: "\v", "\\": "\\", "`": "`", "$": "$", "\n": "", "\r": "", "\r\n": "" };
 
-function unescapeTemplateLiteral(raw) {
-  return raw
-    .replace(/\\([\\`$])/g, "$1")
-    .replace(/\\n/g, "\n")
-    .replace(/\\r/g, "\r")
-    .replace(/\\t/g, "\t");
+function decodePromptLiteral(source) {
+  const parts = [];
+  let position = 0;
+  for (const match of source.matchAll(/`|\$\{|\\(?:u\{([\da-fA-F]{1,6})\}|u([\da-fA-F]{4})|x([\da-fA-F]{2})|\r\n|[\s\S])/g)) {
+    parts.push(source.slice(position, match.index));
+    const [token, braced, fixed, byte] = match;
+    if (token === "`") return parts.join("").trim();
+    if (token === "${") return "";
+    const hex = braced ?? fixed ?? byte;
+    if (hex) {
+      parts.push(String.fromCodePoint(parseInt(hex, 16)));
+    } else {
+      const escaped = token.slice(1);
+      if (!Object.hasOwn(TEMPLATE_ESCAPES, escaped)) return "";
+      parts.push(TEMPLATE_ESCAPES[escaped]);
+    }
+    position = match.index + token.length;
+  }
+  return "";
 }
 
 /**
@@ -239,36 +254,35 @@ function unescapeTemplateLiteral(raw) {
  * 的系统提示词。这里从本机 app.asar 里读出同一份文本，避免在开源仓库里重新分发官方文本。
  * 找不到时返回空串，由调用方决定如何兜底。
  */
-export function loadCoworkSystemPrompt(resourcesDir) {
+export function loadCoworkSystemPrompt(resourcesDir, overrideFile) {
+  if (overrideFile) {
+    try {
+      const prompt = readUnpackedFile(overrideFile, MAX_PROMPT_BYTES).toString("utf8").trim();
+      if (prompt) return prompt;
+    } catch {}
+  }
   if (!resourcesDir) return "";
   try {
-    const realResources = fs.realpathSync(resourcesDir);
-    const archivePath = path.join(realResources, "app.asar");
+    const archivePath = path.join(fs.realpathSync(resourcesDir), "app.asar");
     const metadata = fs.lstatSync(archivePath);
-    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size < 24 || metadata.size > MAX_APP_ARCHIVE_BYTES) return "";
-    const source = fs.readFileSync(archivePath);
-    const anchor = source.indexOf(COWORK_PROMPT_ANCHOR);
-    if (anchor < 0) return "";
-    // 模板字面量以 t=` 开头，紧挨着 <application_details>；取它前面那个反引号。
-    const header = source.lastIndexOf(Buffer.from("<application_details>"), anchor);
-    const open = header < 0 ? -1 : source.lastIndexOf(0x60, header);
-    if (open < 0) return "";
-    let end = -1;
-    for (let index = open + 1; index < source.length; index += 1) {
-      if (source[index] !== 0x60) continue;
-      let slashes = 0;
-      for (let back = index - 1; back > open && source[back] === 0x5c; back -= 1) slashes += 1;
-      if (slashes % 2 === 0) {
-        end = index;
-        break;
+    if (!metadata.isFile() || metadata.size > MAX_APP_ARCHIVE_BYTES) return "";
+    const descriptor = fs.openSync(archivePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    try {
+      const stat = fs.fstatSync(descriptor);
+      if (!stat.isFile() || stat.size !== metadata.size || stat.dev !== metadata.dev || stat.ino !== metadata.ino) return "";
+      const chunkSize = 1024 * 1024;
+      for (let start = 0; start + COWORK_PROMPT_ANCHOR.length <= stat.size; start += chunkSize - COWORK_PROMPT_ANCHOR.length + 1) {
+        const buffer = readExactly(descriptor, Math.min(chunkSize, stat.size - start), start);
+        const anchor = buffer.indexOf(COWORK_PROMPT_ANCHOR);
+        if (anchor < 0) continue;
+        const position = start + anchor + 1;
+        return decodePromptLiteral(readExactly(descriptor, Math.min(MAX_PROMPT_BYTES, stat.size - position), position).toString("utf8"));
       }
+    } finally {
+      fs.closeSync(descriptor);
     }
-    if (end < 0) return "";
-    const prompt = unescapeTemplateLiteral(source.subarray(open + 1, end).toString("utf8")).trim();
-    return prompt.startsWith("<application_details>") ? prompt : "";
-  } catch {
-    return "";
-  }
+  } catch {}
+  return "";
 }
 
 export function createOfficialAssets(resourcesDir) {

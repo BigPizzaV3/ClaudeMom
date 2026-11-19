@@ -236,8 +236,34 @@ async function openTlsUpgrade({
 
 before(async () => {
   dictationStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-local-dictation-"));
-  coworkPromptFile = path.join(os.tmpdir(), `claude-local-cowork-${process.pid}.txt`);
+  coworkPromptFile = path.join(dictationStateDir, "cowork-prompt.txt");
   fs.writeFileSync(coworkPromptFile, coworkPromptFixture, { mode: 0o600 });
+  const stateFile = path.join(dictationStateDir, "conversation-state.json");
+  fs.writeFileSync(stateFile, JSON.stringify({
+    version: 1,
+    conversations: [{
+      uuid: "11111111-2222-4333-8444-555555555557",
+      name: "Persisted legacy conversation",
+      created_at: "2026-01-01T00:00:00.000Z",
+      updated_at: "2026-01-01T00:00:00.000Z",
+      nextIndex: 1,
+      leafMessageId: "11111111-2222-4333-8444-555555555558",
+      turns: [],
+      chat_messages: [{
+        uuid: "11111111-2222-4333-8444-555555555558",
+        sender: "human",
+        text: "legacy",
+        index: 0,
+        created_at: "2026-01-01T00:00:00.000Z",
+        parent_message_uuid: null,
+        files: null,
+        files_v2: null,
+        attachments: [{ file_name: "legacy.txt" }],
+        sync_sources: null,
+      }],
+    }],
+    notifications: [],
+  }));
   dictationCacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-local-cache-"));
   const assetHost = "assets-proxy.anthropic.com";
   dictationAssetPath = "/claude-ai/v2/assets/v1/c342ae4ef-ROR3Yba4.js";
@@ -352,6 +378,7 @@ before(async () => {
       }),
       CLAUDE_LOCAL_CACHE_DIR: dictationCacheDir,
       CLAUDE_LOCAL_COWORK_PROMPT_FILE: coworkPromptFile,
+      CLAUDE_LOCAL_STATE_FILE: path.join(dictationStateDir, "conversation-state.json"),
       CODEX_PLUS_STATE_DIR: dictationStateDir,
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -388,6 +415,7 @@ after(async () => {
   if (coworkPromptFile) fs.unlinkSync(coworkPromptFile);
   if (dictationStateDir) {
     fs.unlinkSync(path.join(dictationStateDir, "dictation-helper.json"));
+    fs.unlinkSync(path.join(dictationStateDir, "conversation-state.json"));
     fs.rmdirSync(dictationStateDir);
   }
   if (dictationCacheDir) {
@@ -810,12 +838,80 @@ test("model requests strip diagnostics and preserve the rest of the payload", as
   assert.deepEqual(gatewayRequests.at(-1), { path: "/v1/messages?beta=true", body: payload });
 });
 
+test("legacy persisted messages with null array fields are normalized before returning to the desktop", async () => {
+  const result = await request(
+    "/api/organizations/local/chat_conversations/11111111-2222-4333-8444-555555555557",
+    { host: "claude.ai" },
+  );
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body.chat_messages[0].files, []);
+  assert.deepEqual(result.body.chat_messages[0].files_v2, []);
+  assert.deepEqual(result.body.chat_messages[0].attachments, [{ file_name: "legacy.txt" }]);
+  assert.deepEqual(result.body.chat_messages[0].sync_sources, []);
+});
+
+test("plugin installed-check returns its checked-list contract", async () => {
+  const result = await request("/api/organizations/local/library/plugins/installed_check", {
+    host: "claude.ai",
+    body: { sync: "desktop_plugins", plugins: [{ id: "example", name: "Example" }] },
+  });
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body, { checked: [] });
+});
+
+test("unknown remote plugin details return the API not-found contract", async () => {
+  for (const pathname of [
+    "/api/organizations/local/plugins/example-plugin",
+    "/api/organizations/local/plugins/by-name/example-plugin?marketplace_name=official",
+  ]) {
+    const result = await request(pathname, { host: "claude.ai" });
+    assert.equal(result.status, 404);
+    assert.equal(result.body.error.details.error_code, "plugin_not_found");
+  }
+});
+
+test("frame type catalog and plugin registry return validated list shapes", async () => {
+  const types = await request("/api/frame/types", { host: "claude.ai" });
+  assert.equal(types.status, 200);
+  assert.deepEqual(types.body.types, []);
+  const registry = await request("/api/organizations/local/plugins/registry", { host: "claude.ai" });
+  assert.equal(registry.status, 200);
+  assert.deepEqual(registry.body.data, []);
+});
+
 for (const host of [undefined, "api.anthropic.com", "claude.ai"]) {
   test(`policy limits keep the object shape the desktop validator expects over ${host || "direct HTTP"}`, async () => {
     const result = await request("/api/claude_code/policy_limits", { host });
     assert.equal(result.status, 200);
     assert.deepEqual(result.body.restrictions, {});
     assert.deepEqual(result.body.compliance_taints, []);
+  });
+}
+
+for (const host of [undefined, "api.anthropic.com", "claude.ai"]) {
+  test(`plugin directory returns an array page over ${host || "direct HTTP"}`, async () => {
+    for (const pathname of ["/api/directory/plugins", "/api/organizations/local/directory/plugins"]) {
+      const result = await request(pathname, { host });
+      assert.equal(result.status, 200);
+      assert.deepEqual(result.body.data, []);
+      assert.equal(result.body.next_page, null);
+      assert.deepEqual(result.body.facets, {});
+      assert.deepEqual(result.body.omitted, []);
+    }
+  });
+}
+
+for (const host of [undefined, "api.anthropic.com", "claude.ai"]) {
+  test(`DXT extension lists return entries and total over ${host || "direct HTTP"}`, async () => {
+    for (const pathname of [
+      "/api/organizations/local/dxt/extensions",
+      "/api/organizations/local/dxt/installable_extensions",
+    ]) {
+      const result = await request(pathname, { host });
+      assert.equal(result.status, 200);
+      assert.deepEqual(result.body.entries, []);
+      assert.equal(result.body.total, 0);
+    }
   });
 }
 
@@ -843,6 +939,9 @@ test("chat and cowork session title endpoints generate and persist titles via ga
   );
   assert.equal(fetched.status, 200);
   assert.equal(fetched.body.name, "ok");
+  assert.deepEqual(fetched.body.settings, {});
+  assert.deepEqual(fetched.body.files, []);
+  assert.deepEqual(fetched.body.sync_sources, []);
 
   const coworkTitle = await request(
     "/api/organizations/11111111-2222-4333-8444-555555555556/dust/generate_session_title",

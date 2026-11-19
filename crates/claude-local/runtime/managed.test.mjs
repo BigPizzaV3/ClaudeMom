@@ -581,6 +581,7 @@ test("installed template turns on Cowork and uses the classic home unless the ne
   fs.cpSync(path.join(root, "runtime"), runtimeDir, { recursive: true });
   fs.writeFileSync(path.join(runtimeDir, "mock", ".codex-plus-template"), "");
   fs.writeFileSync(path.join(runtimeDir, "mock", "bootstrap.json"), JSON.stringify({
+    system_prompts: { other_prompt: { on: false } },
     org_growthbook: {
       hashing_algorithm: "djb2",
       features: {
@@ -600,12 +601,18 @@ test("installed template turns on Cowork and uses the classic home unless the ne
   const features = async (extra) => {
     const instance = await start({ ...env, ...extra }, runtimeDir);
     try {
-      return (await request(instance, "/edge-api/bootstrap", { host: "claude.ai" })).json;
+      const bootstrap = (await request(instance, "/edge-api/bootstrap", { host: "claude.ai" })).json;
+      const prompts = await request(instance, "/api/bootstrap/local/system_prompts", { host: "claude.ai" });
+      assert.equal(prompts.status, 200);
+      assert.deepEqual(prompts.json, bootstrap.system_prompts);
+      return bootstrap;
     } finally {
       await stop(instance);
     }
   };
   const on = await features({});
+  assert.deepEqual(on.system_prompts.other_prompt, { on: false });
+  assert.ok(on.system_prompts.cowork_system_prompt.value.prompt.length > 0);
   assert.deepEqual(on.org_growthbook.features["574905726"], { defaultValue: true });
   assert.deepEqual(on.org_growthbook.features["577907085"], { defaultValue: true }, "其它功能保持模板原值");
   assert.equal(on.org_growthbook.hashing_algorithm, "djb2");
@@ -613,6 +620,7 @@ test("installed template turns on Cowork and uses the classic home unless the ne
   assert.deepEqual(on.org_growthbook.features["2436273311"], { defaultValue: false });
   assert.deepEqual(Object.keys(on.gated_imports), ["cardinal"]);
   const off = await features({ CLAUDE_LOCAL_COWORK: "0" });
+  assert.deepEqual(off.system_prompts, { other_prompt: { on: false } });
   assert.deepEqual(off.org_growthbook.features["574905726"], { defaultValue: false });
   assert.deepEqual(off.org_growthbook.features["2436273311"], { defaultValue: false }, "主页样式和 Cowork 开关互不相干");
   // 设置里选了合并式主页：两处都按模板原样。
@@ -1061,6 +1069,9 @@ test("RPC replies carry the upstream's HTTP error and RPC conversations open wit
   const detail = await request(service, `/api/organizations/local/chat_conversations/${conv}`, { host: "claude.ai" });
   const messages = detail.json.chat_messages;
   assert.deepEqual(messages.map((m) => m.sender), ["human", "assistant"]);
+  for (const message of messages) {
+    for (const field of ["files", "files_v2", "attachments", "sync_sources"]) assert.deepEqual(message[field], [], field);
+  }
   assert.equal(messages[0].text, "case:http-401");
   assert.match(messages[1].text, /\[网关错误：上游返回 HTTP 401：invalid x-api-key\]$/);
   assert.equal(messages[1].parent_message_uuid, messages[0].uuid);

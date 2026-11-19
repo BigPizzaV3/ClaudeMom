@@ -312,7 +312,6 @@ const RECORDED_BOOTSTRAP = loadRecordedBootstrap();
 // Cowork 的系统提示词由官方桌面端通过 system_prompts.cowork_system_prompt 下发。
 // 本地 mock 缺这一项时，渲染端拿到的提示词是空的，会直接报「Cowork 目前不可用」。
 // 优先从本机 app.asar 读（不在仓库里分发官方文本），读不到时用下面的兜底文案。
-const COWORK_PROMPT_FILE = process.env.CLAUDE_LOCAL_COWORK_PROMPT_FILE;
 const FALLBACK_COWORK_SYSTEM_PROMPT = [
   "<application_details>",
   "Claude is operating as an agent inside the Claude desktop app. The agent is built on Claude Code and the Claude Agent SDK, but Claude should not present itself as Claude Code.",
@@ -325,13 +324,7 @@ const FALLBACK_COWORK_SYSTEM_PROMPT = [
 let coworkSystemPromptCache;
 function coworkSystemPrompt() {
   if (coworkSystemPromptCache !== undefined) return coworkSystemPromptCache;
-  let prompt = "";
-  if (COWORK_PROMPT_FILE) {
-    try {
-      prompt = fs.readFileSync(COWORK_PROMPT_FILE, "utf8").trim();
-    } catch {}
-  }
-  if (!prompt) prompt = loadCoworkSystemPrompt(process.env.CLAUDE_LOCAL_DESKTOP_RESOURCES);
+  const prompt = loadCoworkSystemPrompt(process.env.CLAUDE_LOCAL_DESKTOP_RESOURCES, process.env.CLAUDE_LOCAL_COWORK_PROMPT_FILE);
   coworkSystemPromptCache = prompt || FALLBACK_COWORK_SYSTEM_PROMPT;
   return coworkSystemPromptCache;
 }
@@ -800,9 +793,11 @@ function resolvedBootstrap() {
   };
   // 录制账号自己的状态，不属于本地模式：身份验证待办（hold_notice）会让 Claude 弹「完成验证以继续」、拦掉回复。
   result.hold_notice = null;
-  result.system_prompts = coworkSystemPrompts();
   result.personalized_greeting = withDisplayName(result.personalized_greeting);
-  if (runtime.cowork) forceCowork(result, template);
+  if (runtime.cowork) {
+    result.system_prompts = { ...result.system_prompts, ...coworkSystemPrompts() };
+    forceCowork(result, template);
+  }
   if (!runtime.hubHome) useClassicHome(result, template);
   if (useOfficialShell) {
     // 模板里的 gated_imports 是录制时线上版本的分块清单，与本机外壳对不上：换成本机版本。
@@ -835,11 +830,19 @@ function restTime(value, fallback) {
  * 两边都要能读出来，否则从另一条路径建的会话打开就是空的。
  */
 function restMessages(c) {
-  if (c.chat_messages?.length) return c.chat_messages;
+  // 旧版状态文件可能把数组字段缺省或显式置为 null；新版前端会直接对其调用 .some()/.map()。
+  const withArrays = (message) => ({
+    ...message,
+    files: Array.isArray(message?.files) ? message.files : [],
+    files_v2: Array.isArray(message?.files_v2) ? message.files_v2 : [],
+    attachments: Array.isArray(message?.attachments) ? message.attachments : [],
+    sync_sources: Array.isArray(message?.sync_sources) ? message.sync_sources : [],
+  });
+  if (c.chat_messages?.length) return c.chat_messages.map(withArrays);
   const messages = [];
   for (const turn of c.turns || []) {
     const created = restTime(turn.created, c.created_at);
-    const entry = (uuid, sender, index, parent, text, extra = {}) => ({
+    const entry = (uuid, sender, index, parent, text, extra = {}) => withArrays({
       uuid, sender, index, parent_message_uuid: parent ?? null, text,
       content: [{ type: "text", text, citations: [] }],
       created_at: created, updated_at: created, ...extra,
@@ -865,6 +868,14 @@ function convToRest(c, { messages = false } = {}) {
   const title = c.name && c.name !== "New conversation" ? c.name : "";
   return {
     ...REST_CONV_TEMPLATE,
+    // 新版前端会对这些字段直接调用数组/对象操作；录制的 conversations.json 可能为空，
+    // 而旧模板字段也可能是 null，因此本地 API 必须保证返回正确形状。
+    settings: REST_CONV_TEMPLATE.settings && typeof REST_CONV_TEMPLATE.settings === "object" ? REST_CONV_TEMPLATE.settings : {},
+    project_uuid: REST_CONV_TEMPLATE.project_uuid ?? null,
+    is_starred: REST_CONV_TEMPLATE.is_starred ?? false,
+    is_archived: REST_CONV_TEMPLATE.is_archived ?? false,
+    files: Array.isArray(REST_CONV_TEMPLATE.files) ? REST_CONV_TEMPLATE.files : [],
+    sync_sources: Array.isArray(REST_CONV_TEMPLATE.sync_sources) ? REST_CONV_TEMPLATE.sync_sources : [],
     uuid: c.uuid,
     id: c.uuid,
     name: title,
@@ -1163,6 +1174,17 @@ function mockApi(req, res, url) {
     });
   }
 
+  // 插件安装状态核对：客户端要求 `checked` 数组；通用 library 分页结构会触发加载错误。
+  if (method === "POST" && /^\/api\/organizations\/[^/]+\/library\/plugins\/installed_check$/.test(p)) {
+    return json(res, { checked: [] });
+  }
+  // 本地 mock 没有官方插件元数据或下载包；返回 API 能识别的 not-found，而不是 200 + {}，
+  // 这样详情页能处理明确的缺失状态，不会把空对象当成功插件数据渲染。
+  if (method === "GET" && /^\/api\/organizations\/[^/]+\/plugins\/(?:by-name\/[^/]+|[^/]+)$/.test(p) &&
+      !/\/plugins\/(?:list-plugins|registry)$/.test(p)) {
+    return json(res, { error: { details: { error_code: "plugin_not_found" } } }, 404);
+  }
+
   // 分页/列表类接口：客户端会 flatMap 取 .items/.data，回 {} 会出 [undefined] 元素
   // → render 时 TypeError 进 fatal boundary（0NV6PUA 崩溃页的来源）
   // 列表页校验（shared-l-p-m-w-0 rG）：{data:[...], pagination:{has_more:boolean}} 必须成立
@@ -1213,7 +1235,9 @@ function mockApi(req, res, url) {
   if (/\/marketplaces\//.test(p)) {
     return json(res, { ...pageShape, marketplaces: [] });
   }
+  if (method === "GET" && p === "/api/frame/types") return json(res, { ...pageShape, types: [] });
   if (p.startsWith("/api/frame/")) return json(res, pageShape);
+  if (method === "GET" && /^\/api\/organizations\/[^/]+\/plugins\/registry$/.test(p)) return json(res, { data: [] });
   // 客户端按 plugin id 读取元数据字典，每个值都必须是对象。
   if (p.endsWith("/cowork_plugin_metadata")) return json(res, {});
 
@@ -1300,6 +1324,9 @@ function mockApi(req, res, url) {
 
   if (p === "/api/bootstrap" || p === "/api/account" || p === "/api/account_profile") {
     return jsonWithActiveOrg(res, resolvedBootstrap());
+  }
+  if (method === "GET" && /^\/api\/bootstrap\/[^/]+\/system_prompts$/.test(p)) {
+    return json(res, resolvedBootstrap().system_prompts ?? {});
   }
   if (/^\/api\/bootstrap\/[^/]+\/app_start$/.test(p)) {
     return jsonWithActiveOrg(res, resolvedBootstrap());
@@ -1537,6 +1564,13 @@ function mockApi(req, res, url) {
   if (method === "GET" && p === "/api/directory/servers") {
     return json(res, { servers: [], next_cursor: null });
   }
+  // 插件目录页校验 {data:[...]}；通用 {} 会触发 RegistryFetchError: expected array。
+  if (method === "GET" && (p === "/api/directory/plugins" || /^\/api\/organizations\/[^/]+\/directory\/plugins$/.test(p))) {
+    return json(res, { data: [], next_page: null, facets: {}, omitted: [] });
+  }
+  if (method === "GET" && /\/dxt\/(?:extensions|installable_extensions)$/.test(p)) {
+    return json(res, { entries: [], total: 0 });
+  }
   if (method === "GET" && /^\/api\/organizations\/[^/]+\/activation\/[^/]+\/tasks$/.test(p)) {
     return json(res, { tasks: [] });
   }
@@ -1558,10 +1592,6 @@ function mockApi(req, res, url) {
   }
   if (/\/feature|flags|eligib/.test(p)) {
     return json(res, BOOTSTRAP.feature_flags);
-  }
-  // Cowork 的系统提示词配置：官方桌面端从 /api/bootstrap/<org>/system_prompts 取。
-  if (method === "GET" && /^\/api\/bootstrap\/[^/]+\/system_prompts$/.test(p)) {
-    return json(res, coworkSystemPrompts());
   }
   // 未知 API 兜底；有结构要求的接口必须在上方单独实现。
   return json(res, {});
@@ -2190,6 +2220,12 @@ function handle(req, res, hostHeader) {
           organization: { uuid: ORG.uuid, name: ORG.name },
         });
       }
+      if (url.pathname === "/api/directory/plugins" || /^\/api\/organizations\/[^/]+\/directory\/plugins$/.test(url.pathname)) {
+        return json(res, { data: [], next_page: null, facets: {}, omitted: [] });
+      }
+      if (/\/dxt\/(?:extensions|installable_extensions)$/.test(url.pathname)) {
+        return json(res, { entries: [], total: 0 });
+      }
       // 远端托管策略：本地空放行（不挡插件/连接器）。
       // CLI 比 Desktop 校验更严格，settings 响应必须包含 uuid/checksum/settings。
       // policy_limits → {restrictions:{},compliance_taints:[],defaults:{}}（BymwSUZ2 校验器）
@@ -2608,6 +2644,12 @@ const outer = http.createServer((req, res) => {
   // 会话 apiHost=127.0.0.1:8899 时，托管设置/policy 也会打到这里：本地 mock，别转 magpie
   if (/^\/api\/claude_cli\/bootstrap/.test(u.pathname)) {
     return json(res, { client_data: {}, settings: {}, config: {}, enabled: true, environments: [], sessions: [], plugins: [], items: [], data: [] });
+  }
+  if (u.pathname === "/api/directory/plugins" || /^\/api\/organizations\/[^/]+\/directory\/plugins$/.test(u.pathname)) {
+    return json(res, { data: [], next_page: null, facets: {}, omitted: [] });
+  }
+  if (/\/dxt\/(?:extensions|installable_extensions)$/.test(u.pathname)) {
+    return json(res, { entries: [], total: 0 });
   }
   if (/^\/api\/claude_code\/policy_limits/.test(u.pathname)) {
     return json(res, POLICY_LIMITS);
