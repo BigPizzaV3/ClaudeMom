@@ -7,8 +7,10 @@
 - 会话与项目绑定：会话行带 `chat_project_id`（REST 与 Code 会话行双发 `project_uuid`），`POST /chat_conversations` 接受 `project_uuid`/`chat_project_id` 建立归属；`GET /v1/code/sessions?chat_project_id=` 按项目过滤；`/projects/move_conversations` 支持把会话挪进/挪出项目。
 - 知识库子资源契约修正：`/syncs` 回顶层数组（前端 `Array.isArray` 校验），`POST /sync` 回 `kb_resync_status:"done"` 避免前端 5 秒轮询，详情响应带 `has_sync_sources:false`。
 - `/v1/*` 请求（claude.ai 域）现在和 `/api/*` 一样进本地 mock 层，不再落进通用 `{}` 兜底——此前 Code 会话列表等接口永远返回空对象。
+- 6.x Code 面板的新建项目走 `/v1/code/channels`（createChannel）。本地实现了 channels 的创建/列表/详情/改名/归档/删除，并把 channel id 与本地项目存储打通；之前落到 `/v1/` 兜底返回 `{sessions:[]}`，前端拿不到 `channel.id` 会报「出了点问题」。
+- 录制脚本在 Windows 上可用了：`sanitize-mock.mjs` 的入口判断改用 `pathToFileURL`（原先 `file://${argv[1]}` 在反斜杠路径下永远不匹配，脚本静默不执行）；录完的 shell 若不在固定路由的缓存键下，会扫描缓存按 build id 匹配。
 - 新建项目弹窗不再等 GitHub 仓库列表和 GitHub App 安装状态：这些请求在本地直接回空。之前它们转发上游后 20 秒超时，会以未处理的 socket error 把本地服务打崩，弹窗按钮也一直不可用。
-- Artifacts：聊天现在能真正产出作品。模型会拿到 `mcp__claude-artifacts__*` 工具（create_from_type / publish_version / list_artifacts …），调用结果写到官方 typed-artifacts 目录；claude.ai 页面右下角出现「Artifacts」面板，新作品自动弹出，可在 iframe 里预览、在浏览器里打开。`/api/frame/*`、`/api/frame/types`、frame 查看器外壳和 `*.claudeusercontent.com` 运行时都由本地服务提供，Code/Cowork 与聊天共用同一批作品。
+- Artifacts：聊天现在能真正产出作品。模型会拿到 `mcp__claude-artifacts__*` 工具（create_from_type / publish_version / list_artifacts …），调用结果写到官方 typed-artifacts 目录。`/api/frame/*`、`/api/frame/types`、frame 查看器外壳和 `*.claudeusercontent.com` 运行时都由本地服务提供，Code/Cowork 与聊天共用同一批作品。
 - 上游不支持 `tools` 时自动退回纯文本回复，不影响普通聊天。
 
 ## 0.1.12 - 2026-11-20

@@ -179,16 +179,29 @@ function exportShell(identity = null) {
     buildId = JSON.parse(fs.readFileSync(path.join(OUT, "bootstrap.json"), "utf8")).gated_imports_build_id;
   } catch {}
   const cacheDir = path.join(path.dirname(SRC), ".cache");
-  for (const key of ["claude.ai/login", "claude.ai/epitaxy", "claude.ai/new", "claude.ai/"]) {
-    const file = path.join(cacheDir, crypto.createHash("sha1").update(key).digest("hex"));
+  const candidates = ["claude.ai/login", "claude.ai/epitaxy", "claude.ai/new", "claude.ai/"].map(
+    (key) => path.join(cacheDir, crypto.createHash("sha1").update(key).digest("hex")),
+  );
+  // 录制脚本最后打开的页面不一定是上面几个固定路径（例如 /settings/general），
+  // 找不到时扫描整个缓存，挑 build id 一致且体积最大的 HTML。
+  try {
+    for (const f of fs.readdirSync(cacheDir)) {
+      if (!f.endsWith(".json")) candidates.push(path.join(cacheDir, f));
+    }
+  } catch {}
+  let best = null;
+  for (const file of candidates) {
     let body;
     try { body = fs.readFileSync(file); } catch { continue; }
     const found = body.subarray(0, 4096).toString("utf8").match(/<html\b[^>]*\bdata-build-id="([^"]+)"/i)?.[1];
     if (body.length < 4096 || !found || found !== buildId) continue;
-    let html = body.toString("utf8");
+    if (!best || body.length > best.body.length) best = { file, body, found };
+  }
+  if (best) {
+    let html = best.body.toString("utf8");
     for (const [from, to] of [...(identity?.uuids ?? []), ...(identity?.strings ?? [])]) html = html.split(from).join(to);
     fs.writeFileSync(path.join(OUT, "shell.html"), html);
-    console.log(`shell ${key} (build ${found}) -> ${path.join(OUT, "shell.html")}`);
+    console.log(`shell ${path.basename(best.file)} (build ${best.found}) -> ${path.join(OUT, "shell.html")}`);
     return;
   }
   console.warn(`! 没在 ${cacheDir} 找到 build ${buildId ?? "（未知）"} 的页面外壳：shell.html 缺失，这个版本不能用（build.rs 会报错）`);

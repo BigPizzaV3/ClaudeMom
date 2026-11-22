@@ -445,18 +445,6 @@ function localI18n(pathname) {
 // ── 工具 ─────────────────────────────────────────────────────
 const now = () => new Date().toISOString();
 const log = (...a) => LOG && console.log(`[${now()}]`, ...a);
-// TEMP(debug)：本地联调时把请求与状态码写到 requests.log；文件不存在时不记录。
-// 排查完 Projects 弹窗的 loading 问题后删除。
-const DEBUG_REQUESTS = path.join(here, "requests.log");
-function traceRequest(req, url, res) {
-  let enabled = false;
-  try { enabled = fs.statSync(DEBUG_REQUESTS).isFile(); } catch {}
-  if (!enabled) return;
-  const line = `${now()} ${req.method} ${url.pathname}${url.search}`;
-  res.on("finish", () => {
-    try { fs.appendFileSync(DEBUG_REQUESTS, `${line} -> ${res.statusCode}\n`); } catch {}
-  });
-}
 
 // ── Artifacts（typed-artifact 本地实现）──────────────────────
 // 读写官方 Claude Desktop 的 typed-artifacts 目录：官方 Artifacts 页、Code/Cowork
@@ -475,39 +463,9 @@ const artifactService = createArtifactService({
   localAccount: { uuid: ACCOUNT.uuid, name: ACCOUNT.name, email: ACCOUNT.email },
   log,
 });
-// 页面外壳里注入本地 Artifact 面板（同源脚本，随壳一起出）。
-const OFFICIAL_SHELL_HTML = officialShell ? artifactService.injectPanel(officialShell) : null;
-const TEMPLATE_SHELL_HTML = TEMPLATE_SHELL ? artifactService.injectPanel(TEMPLATE_SHELL) : null;
-// Code 页面（/epitaxy）跳过内置的 bootstrap preload：preload 只把账号写进内存 store，
-// 不写 query cache；随后账号查询因为「已水合」被禁用，isPending 永远为 true，
-// 新建项目弹窗的 isAccountLoading 就一直等下去。跳过 preload 后查询走 /api/bootstrap 正常结束。
-const DEBUG_CLIENT_ERROR_SCRIPT = `<script>
-(function(){
-  function send(payload){try{fetch("/__client_error",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(payload)}).catch(function(){})}catch(e){}}
-  addEventListener("error",function(e){var t=e.target||{};send({kind:"error",message:String(e.message),source:String(e.filename)+":"+e.lineno+":"+e.colno,stack:String(e.error&&e.error.stack||""),tag:String(t.tagName||""),url:String(t.src||t.href||"")})},true);
-  addEventListener("unhandledrejection",function(e){send({kind:"rejection",message:String(e.reason&&(e.reason.message||e.reason)),stack:String(e.reason&&e.reason.stack||"")})});
-  // chunk 加载诊断：vite:preloadError（import 失败）与 ant:stylesheet-skipped（CSS 放弃）都只在 window 上派发一次
-  addEventListener("vite:preloadError",function(e){send({kind:"chunk",message:"vite:preloadError payload="+String(e.payload&&(e.payload.message||e.payload)),stack:""})});
-  addEventListener("ant:stylesheet-skipped",function(e){send({kind:"chunk",message:"ant:stylesheet-skipped href="+String(e.detail&&e.detail.href),stack:""})});
-  addEventListener("ant:import-healed",function(e){send({kind:"chunk-healed",message:"ant:import-healed repeats="+String(e.detail&&e.detail.repeat),stack:""})});
-})();
-</script>`;
-function withDebugScript(html) {
-  if (!html) return html;
-  const text = Buffer.isBuffer(html) ? html.toString("utf8") : html;
-  if (!/<head[^>]*>/i.test(text)) return html;
-  return Buffer.from(text.replace(/<head([^>]*)>/i, `<head$1>${DEBUG_CLIENT_ERROR_SCRIPT}`));
-}
-const TEMPLATE_SHELL_NO_PRELOAD_HTML = (() => {
-  if (!TEMPLATE_SHELL_HTML) return null;
-  const html = withDebugScript(TEMPLATE_SHELL_HTML).toString("utf8");
-  if (!/<head[^>]*>/i.test(html)) return null;
-  return Buffer.from(html.replace(
-    /<head([^>]*)>/i,
-    "<head$1><script>window.__SKIP_BOOTSTRAP_PRELOAD__=true;</script>",
-  ));
-})();
-
+// 页面外壳直接用录制/官方的 HTML；本地 Artifact 面板不再注入页面。
+const OFFICIAL_SHELL_HTML = officialShell || null;
+const TEMPLATE_SHELL_HTML = TEMPLATE_SHELL || null;
 // Chat 的 completion 请求体字段随客户端版本变化：从常见位置兜底取最近一条用户文本（跳过助手消息）。
 function firstUserText(value, depth = 0) {
   if (depth > 4 || value == null) return "";
@@ -1180,6 +1138,116 @@ function localCodeApi(req, res, url, p) {
   return false;
 }
 
+// Code 面板的「项目」在 6.x 前端实际走 /v1/code/channels（createChannel / listChannels /
+// updateChannel）。创建项目 = 创建一个 channel；这里把 channel 映射到本地 project 存储，
+// 保证同一个 id 既能从 channels 读，也能从 /api/organizations/{org}/projects/{id} 读。
+function channelView(project) {
+  return {
+    id: project.uuid,
+    channel_id: project.uuid,
+    name: project.name,
+    visibility: project.is_private ? "private" : "public",
+    is_private: project.is_private !== false,
+    topic: project.description || "",
+    icon: project.icon ?? null,
+    color: project.color ?? null,
+    archived: !!project.archived_at,
+    is_archived: !!project.archived_at,
+    created_at: project.created_at,
+    updated_at: project.updated_at,
+    creator: project.creator,
+    created_by_account_id: project.creator?.uuid ?? ACCOUNT.uuid,
+    caller_relations: ["owner"],
+    caller_through_group: false,
+    // 侧栏/详情用 members 判断「joined」并把 channel 收进本地 space store；
+    // 空数组会让项目出现在列表里却在详情页被当作不存在。
+    members: [{ account_id: ACCOUNT.uuid, role: "owner", through_group: false }],
+    members_truncated: false,
+    member_count: 0,
+    group_count: 0,
+    context_sources: [],
+    unavailable_actions: [],
+    space_id: null,
+    has_unread: false,
+    unread_count: 0,
+  };
+}
+function channelsApi(req, res, url, p) {
+  const match = p.match(/^\/v1\/code\/channels(?:\/([^/]+))?(\/.*)?$/);
+  if (!match) return false;
+  const id = match[1] ? decodeURIComponent(match[1]) : null;
+  const sub = match[2] || "";
+  const all = () => [...PROJECTS.values()].filter((row) => !row.archived_at).map(channelView);
+  if (!id) {
+    if (req.method === "GET") {
+      const channels = all();
+      return json(res, { channels, data: channels, items: channels, has_more: false, next_cursor: null }), true;
+    }
+    if (req.method === "POST") {
+      readBody(req, (raw) => {
+        const body = decodeJsonBody(req, raw);
+        const project = projectRecord({
+          name: body.name,
+          description: body.topic ?? body.description,
+          is_private: body.visibility !== "public",
+        });
+        project.icon = body.icon ?? null;
+        project.color = body.color ?? null;
+        PROJECTS.set(project.uuid, project);
+        saveProjects();
+        json(res, { channel: channelView(project) }, 201);
+      });
+      return true;
+    }
+    return json(res, { channels: [], data: [], items: [], has_more: false }), true;
+  }
+  const project = PROJECTS.get(id);
+  if (sub === "/archive" || sub === "/unarchive") {
+    if (project) {
+      project.archived_at = sub === "/archive" ? now() : null;
+      project.updated_at = now();
+      project.last_activity_at = project.updated_at;
+      saveProjects();
+    }
+    return json(res, { channel: project ? channelView(project) : null }), true;
+  }
+  if (sub === "/config") return json(res, { channel_id: id, default_environment_id: null }), true;
+  if (sub === "/remote-control-preapproval") return json(res, { folders: [], paths: [] }), true;
+  if (sub === "/threads" || sub === "/timeline") {
+    return json(res, { data: [], items: [], threads: [], has_more: false, next_cursor: null }), true;
+  }
+  if (sub) return json(res, {}), true;
+  if (!project) return json(res, { error: "not_found" }, 404), true;
+  if (req.method === "GET") {
+    const view = channelView(project);
+    // 同时给 `{channel}` 包装和顶层字段：不同版本的详情 hook 读取位置不一样。
+    return json(res, { ...view, channel: view }), true;
+  }
+  if (req.method === "PATCH" || req.method === "PUT") {
+    readBody(req, (raw) => {
+      const body = decodeJsonBody(req, raw);
+      if (typeof body.name === "string") project.name = body.name;
+      if (typeof body.topic === "string") project.description = body.topic;
+      if (typeof body.description === "string") project.description = body.description;
+      if (body.visibility !== undefined) project.is_private = body.visibility !== "public";
+      if (body.icon !== undefined) project.icon = body.icon;
+      if (body.color !== undefined) project.color = body.color;
+      project.updated_at = now();
+      project.last_activity_at = project.updated_at;
+      saveProjects();
+      json(res, { channel: channelView(project) });
+    });
+    return true;
+  }
+  if (req.method === "DELETE") {
+    PROJECTS.delete(id);
+    saveProjects();
+    res.writeHead(204, { "content-length": 0 });
+    return res.end(), true;
+  }
+  return json(res, { channel: channelView(project) }), true;
+}
+
 // Cowork 总开关：GrowthBook 功能 `yukon_silver`，id 是功能名的 Java hashCode（574905726）。
 // 录制模板里它是 false，新版 Claude 因此只显示 Chat / Code。必须在模板合并之后改写，
 // 否则模板的 false 会盖掉。id 的算法跟模板走：只改写模板自带的 GrowthBook 表，
@@ -1801,6 +1869,7 @@ function mockApi(req, res, url) {
     });
   }
 
+  if (channelsApi(req, res, url, p)) return;
   // 代码会话/环境（epitaxy 路由）：(n ?? Ra).filter 要求字段为数组
   if (/^\/v1\//.test(p)) {
     return json(res, {
@@ -2231,9 +2300,9 @@ function serveCachedStaticAsset(req, res, url) {
         typeof meta.headers?.["content-type"] !== "string" ||
         /\b(?:private|no-store)\b/i.test(String(meta.headers["cache-control"] || ""))) return false;
     let body = fs.readFileSync(cp);
-    // TEMP(debug)：新版客户端 + 录制的旧模板混用时，账号 provider 的 loading 不会结束，
-    // 新建项目弹窗的按钮一直置灰。这里把弹窗模块里的 isAccountLoading 强制为 false，
-    // 先验证创建链路；找到 provider 的真正原因后再删掉。
+    // 录制模板（5.x）与 6.x 客户端混用时，新建项目弹窗的提交守卫依赖本地永远不齐的异步查询
+    // （账号 provider / environments），表现为按钮置灰或点击无反应。这里在返回这些弹窗
+    // chunk 时放宽提交条件；只影响本地模式下的这两个模块。
     if (/\/c4a0274e5-[^/]+\.js$/.test(url.pathname) || /\/cf0b6cdd1-[^/]+\.js$/.test(url.pathname)) {
       let bytes = body;
       const encoding = String(meta.headers?.["content-encoding"] || "").toLowerCase();
@@ -2337,7 +2406,7 @@ function serveDocShell(req, res, url) {
   const host = url.host || "claude.ai";
   const shell = readDocShell(host);
   if (shell) {
-    const body = Buffer.from(artifactService.injectPanel(addExtensions(shell)), "utf8");
+    const body = Buffer.from(addExtensions(shell), "utf8");
     res.writeHead(200, {
       "content-type": "text/html; charset=utf-8",
       "content-length": body.length,
@@ -2374,7 +2443,7 @@ function serveDocShell(req, res, url) {
           );
         }
         const page = r.statusCode === 200 && !r.headers["content-encoding"] ? addExtensions(body) : body;
-        const html = Buffer.from(artifactService.injectPanel(page), "utf8");
+        const html = Buffer.isBuffer(page) ? page : Buffer.from(String(page), "utf8");
         res.writeHead(r.statusCode || 502, {
           "content-type": "text/html; charset=utf-8",
           "content-length": html.length,
@@ -3111,21 +3180,9 @@ function handle(req, res, hostHeader) {
   const url = new URL(req.url, `https://${host}`);
   noteClient();
   log(`${req.method} ${url.pathname}`);
-  traceRequest(req, url, res);
 
   const hostName = url.hostname.toLowerCase();
   const isMainClaudeHost = /^(claude\.ai|www\.claude\.ai|claude\.com|www\.claude\.com)$/.test(hostName);
-
-  // TEMP(debug)：页面注入的全局错误上报，写到 requests.log 方便定位弹窗加载失败。
-  if (req.method === "POST" && url.pathname === "/__client_error") {
-    return readBody(req, (raw) => {
-      try {
-        fs.appendFileSync(path.join(here, "requests.log"), `${now()} CLIENT-ERROR ${raw.toString("utf8").slice(0, 4000)}\n`);
-      } catch {}
-      res.writeHead(204, { "content-length": 0 });
-      res.end();
-    });
-  }
 
   // Artifacts：MCP 端点不分域名（CLI 可能走 claude.ai 或 api.anthropic.com）。
   if (req.method === "POST" && url.pathname === "/api/artifacts/mcp") {
@@ -3278,13 +3335,12 @@ function handle(req, res, hostHeader) {
     !/^\/(?:api|edge-api|v1|claudeai-rpc)(?:\/|$)/.test(url.pathname)
   ) {
     const shell = addExtensions(officialShell);
-    const withPanel = artifactService.injectPanel(shell);
     res.writeHead(200, {
       "content-type": "text/html; charset=utf-8",
-      "content-length": Buffer.byteLength(withPanel),
+      "content-length": Buffer.byteLength(shell),
       "cache-control": "no-cache",
     });
-    return res.end(withPanel);
+    return res.end(shell);
   }
 
   if (
@@ -3525,10 +3581,7 @@ function handle(req, res, hostHeader) {
     !path.extname(url.pathname) &&
     !/^\/(?:api|edge-api|v1|claudeai-rpc)(?:\/|$)/.test(url.pathname)
   ) {
-    const baseShell = url.pathname.startsWith("/epitaxy") && TEMPLATE_SHELL_NO_PRELOAD_HTML
-      ? TEMPLATE_SHELL_NO_PRELOAD_HTML
-      : withDebugScript(TEMPLATE_SHELL_HTML);
-    const shell = artifactService.injectPanel(addExtensions(baseShell));
+    const shell = addExtensions(TEMPLATE_SHELL_HTML);
     res.writeHead(200, {
       "content-type": "text/html; charset=utf-8",
       "content-length": Buffer.byteLength(shell),

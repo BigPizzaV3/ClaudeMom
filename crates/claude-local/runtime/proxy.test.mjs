@@ -883,6 +883,26 @@ test("project sessions bind via chat_project_id and show in conversations_v2 and
   await requestText("claude.ai", `/api/organizations/${org}/projects/${projectId}`, {}, "DELETE");
 });
 
+test("Code channels create projects and keep the id readable through the projects API", async () => {
+  const created = await request("/v1/code/channels", {
+    host: "claude.ai",
+    body: { name: "Channel project", visibility: "private", icon: "folder", color: "blue" },
+  });
+  assert.equal(created.status, 201);
+  assert.ok(created.body.channel.id);
+  assert.equal(created.body.channel.name, "Channel project");
+
+  const detail = await request(`/api/organizations/local/projects/${created.body.channel.id}`, { host: "claude.ai" });
+  assert.equal(detail.status, 200);
+  assert.equal(detail.body.uuid, created.body.channel.id);
+
+  const list = await request("/v1/code/channels", { host: "claude.ai" });
+  assert.equal(list.status, 200);
+  assert.equal(list.body.channels.some((row) => row.id === created.body.channel.id), true);
+
+  await requestText("claude.ai", `/v1/code/channels/${created.body.channel.id}`, {}, "DELETE");
+});
+
 test("project creation dialog dependencies resolve locally instead of hanging upstream", async () => {
   const repos = await request("/api/organizations/local/code/repos?skip_status=true&page=1&per_page=100&include_link_optional=true", {
     host: "claude.ai",
