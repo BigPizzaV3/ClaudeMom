@@ -173,6 +173,12 @@ const dataManaged = runtime.managed && !POC_DIR;
 // 首次启动也不依赖能连上 claude.ai。只在没有模板数据时这样用：本机这份是 Claude 第三方模式的界面，
 // 配上按 claude.ai 录制的模板数据对不上；要用它请选「本机版」界面（第三方模式启动）。
 const useOfficialShell = Boolean(officialShell) && dataManaged;
+// 模板模式下主站外壳用录制版本，但 frame-shell.html（artifact 查看器外壳）没有模板录制、
+// 一直从本机 ion-dist 出（artifacts.mjs serveViewerShell）。它的 JS/CSS chunk 也必须同源：
+// 走「缓存→上游」链时，本机 6.x 的 chunk 名在旧缓存里 MISS，转发上游会被 302 到
+// app-unavailable-in-region（受限地区），chunk 永远加载不出 → "Couldn't load artifact"。
+// officialAssets 存在时，/assets/v1/frame-*、shared-frame-*、vendor-frame-* 等查看器资产直接从 asar 出。
+const FRAME_ASSETS_AVAILABLE = Boolean(officialAssets);
 // 模板自带的页面外壳（mock/shell.html）：与模板数据同一次录制、同一个前端版本。
 // 有它时主站的页面导航一律用它，不看缓存、不去线上抓：线上页面会换版本，
 // 配上按旧版本录制的模板就会界面错乱、Code 页卡在加载（新用户没有缓存时必然拿到线上版本）。
@@ -3270,7 +3276,18 @@ function handle(req, res, hostHeader) {
 
   const officialResourcePath = (() => {
     // 外壳用本机版本时，它引用的静态资源也从本机资源包出（见 useOfficialShell）。
-    if (!useOfficialShell || !["GET", "HEAD"].includes(req.method)) return null;
+    if (!["GET", "HEAD"].includes(req.method)) return null;
+    if (!useOfficialShell) {
+      // 模板模式：主站 UI 资源仍跟模板走，但 artifact 查看器（frame）资产没有模板录制、
+      // 外壳 HTML 来自本机 ion-dist（serveViewerShell），chunk 必须同源，否则旧缓存
+      // MISS 后转发上游会被 302 到 app-unavailable-in-region。范围不用猜文件名：
+      // frame 外壳只引用 /assets/v1/ 下的资源，asar 里有就接管（JS/CSS/字体/图标），
+      // 没有则回落模板链。模板 UI chunk 与 asar 重名时以 asar 为准也无碍——模板外壳
+      // 引用的是自己录制的文件名（build 不同，不重名）。
+      if (!FRAME_ASSETS_AVAILABLE || !isMainClaudeHost) return null;
+      if (!/^\/assets\/v1\/[^\s]+\.(?:m?js|css|woff2?|ttf|otf|png|jpe?g|webp|gif|svg|ico|wasm|json)$/.test(url.pathname)) return null;
+      return officialAssets.read(url.pathname) ? url.pathname : null;
+    }
     const mapI18nPath = (pathname) => {
       const match = pathname.match(/^\/i18n\/(?:(s|dynamic)\/)?([a-zA-Z-]+)\.json$/);
       if (!match) return pathname;
@@ -3941,9 +3958,12 @@ const outer = http.createServer((req, res) => {
   return readBody(req, fwd);
 });
 
+// claudeusercontent.com（含 <uuid>.claudeusercontent.com 内容子域）必须终止 TLS：
+// handle() 里有该域的 frame 运行时路由，服务证书 SAN 也覆盖它。漏掉的话 CONNECT 直通，
+// 内容 iframe 的 TLS 握手打到真实互联网（受限环境会被重置），作品永远 "Couldn't load artifact"。
 const MITM_HOSTS = runtime.managed
-  ? /(^|\.)(claude\.ai|claude\.com|anthropic\.com)$/i
-  : /(^|\.)(claude\.ai|claude\.com|anthropic\.com|ccbobi\.com)$/i;
+  ? /(^|\.)(claude\.ai|claude\.com|anthropic\.com|claudeusercontent\.com)$/i
+  : /(^|\.)(claude\.ai|claude\.com|anthropic\.com|ccbobi\.com|claudeusercontent\.com)$/i;
 
 const PASS_THROUGH_CONNECT_TIMEOUT_MS = 15_000;
 

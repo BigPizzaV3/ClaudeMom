@@ -1275,6 +1275,60 @@ test("installed template lists its example skills as disabled so Claude does not
   }
 });
 
+test("template mode serves frame viewer chunks from the local ion-dist instead of the upstream", async () => {
+  // 回归：artifact 查看器外壳（frame-shell.html）没有模板录制、一直从本机 ion-dist 出，
+  // 它引用的 chunk（frame-shell-chrome 等）若走「缓存→上游」链，会在旧缓存 MISS 后被
+  // 上游 302 到 app-unavailable-in-region（受限地区），导致 "Couldn't load artifact"。
+  // chunk 必须与本机外壳同源（asar），且不能扩大到主站 UI chunk（那些跟模板版本走）。
+  const resources = path.join(root, "desktop-resources-frame");
+  writeAsar(resources, {
+    "index.html": '<!doctype html><html data-build-id="fixture-build"><head><meta charset="UTF-8"></head><body></body></html>',
+    "assets/v1/frame-shell-chrome-LocalBld1.js": "window.frameChrome = true;",
+    "assets/v1/vendor-frame-LocalBld2.js": "window.vendorFrame = true;",
+    "assets/v1/rolldown-runtime-LocalBld3.js": "window.rolldown = true;",
+    "assets/v1/fonts/LocalBld-font.woff2": "font-bytes",
+  });
+  const runtimeDir = path.join(root, "frame-assets-runtime");
+  fs.cpSync(path.join(root, "runtime"), runtimeDir, { recursive: true });
+  fs.writeFileSync(path.join(runtimeDir, "mock", ".codex-plus-template"), "");
+  // 上游代理记录所有 CONNECT：断言 frame chunk 没有去上游。
+  const connects = [];
+  const upstreamProxy = http.createServer();
+  upstreamProxy.on("connect", (req, socket) => {
+    connects.push(req.url);
+    socket.end("HTTP/1.1 403 Forbidden\r\n\r\n");
+  });
+  upstreamProxy.listen(0, "127.0.0.1");
+  await once(upstreamProxy, "listening");
+  upstreamProxy.unref();
+  const instance = await start({
+    CLAUDE_LOCAL_DESKTOP_RESOURCES: resources,
+    CLAUDE_LOCAL_CACHE_DIR: path.join(runtimeDir, ".cache"),
+    CLAUDE_LOCAL_UPSTREAM_PROXY: `http://127.0.0.1:${upstreamProxy.address().port}`,
+  }, runtimeDir);
+  try {
+    const chunk = await request(instance, "/assets/v1/frame-shell-chrome-LocalBld1.js", { host: "claude.ai" });
+    assert.equal(chunk.status, 200);
+    assert.equal(chunk.bytes.toString("utf8"), "window.frameChrome = true;");
+    assert.equal(chunk.headers["content-type"], "text/javascript; charset=utf-8");
+    const vendor = await request(instance, "/assets/v1/vendor-frame-LocalBld2.js", { host: "claude.ai" });
+    assert.equal(vendor.status, 200);
+    const runtime = await request(instance, "/assets/v1/rolldown-runtime-LocalBld3.js", { host: "claude.ai" });
+    assert.equal(runtime.status, 200);
+    // 字体等静态资源同样从 asar 出（frame-shell.html 也会引用）。
+    const font = await request(instance, "/assets/v1/fonts/LocalBld-font.woff2", { host: "claude.ai" });
+    assert.equal(font.status, 200);
+    assert.equal(font.headers["content-type"], "font/woff2");
+    // asar 里没有的资产回落模板链（缓存 MISS → 走上游代理 → 403），不去猜文件名。
+    const main = await request(instance, "/assets/v1/main-LocalBld4.js", { host: "claude.ai" });
+    assert.notEqual(main.status, 200);
+    assert.deepEqual(connects, ["claude.ai:443"], "只有 asar 缺的资产去了上游");
+  } finally {
+    await stop(instance);
+    upstreamProxy.close();
+  }
+});
+
 test("enabled extension packages are injected into the page shell and served same-origin", async () => {
   const resources = path.join(root, "desktop-resources-nonce");
   writeAsar(resources, {

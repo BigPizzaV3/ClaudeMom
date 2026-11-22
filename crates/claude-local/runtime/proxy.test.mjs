@@ -1071,6 +1071,24 @@ test("Artifacts shared galleries receive frame arrays instead of load-error stat
   }
 });
 
+test("artifact content subdomain terminates TLS inside the proxy instead of passing through", async () => {
+  // 回归：MITM_HOSTS 曾漏掉 claudeusercontent.com，CONNECT 直通导致内容 iframe 的
+  // TLS 握手打到真实互联网（受限环境被重置），作品永远 "Couldn't load artifact"。
+  // requestText 用本地 CA 校验服务端证书：若 CONNECT 直通，握手会撞上真实服务器的
+  // 证书链并在 secureConnect 处失败；能拿到 HTTP 响应即证明 TLS 在代理内终止。
+  const uuid = "0aa8aa8a-0000-4000-8000-000000000001";
+  const warmup = await requestText(`${uuid}.claudeusercontent.com`, "/_warmup");
+  assert.equal(warmup.status, 200);
+  // 测试环境没有录制的 frame 运行时：_f 路由命中 handleFrameHost 的 404 JSON 兜底，
+  // 而不是直通后不可预期的远端响应。
+  const content = await requestText(`${uuid}.claudeusercontent.com`, "/_f/v1/index.html");
+  assert.equal(content.status, 404);
+  assert.equal(content.body, JSON.stringify({ error: "not_found" }));
+  // 主站域的 frame 文档探针同样走终止 TLS 的路径
+  const lookup = await requestText("claude.ai", `/api/frame/${uuid}?bk=probe`);
+  assert.ok([200, 404].includes(lookup.status), `probe status ${lookup.status}`);
+});
+
 test("general settings can read and update notification preferences without losing other channels", async () => {
   const endpoint = "/api/organizations/notification-test/notification/preferences";
   const initial = await request(endpoint, { host: "claude.ai" });
