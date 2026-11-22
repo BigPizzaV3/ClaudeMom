@@ -7,18 +7,15 @@ Claude Desktop 的 artifact 能力在第三方网关下不可用：`/api/frame/*
 模型 ──tool_use──► conversation-service ──► artifacts.mjs ──► typed-artifacts 目录
                                               │                    ▲
                                               └─ /api/frame/* ─────┘
-                                                    │
-Claude 页面（注入 artifact-panel.js）◄──────── /__claude_local/artifacts
 ```
 
 ## 组成部分
 
 | 位置 | 作用 |
 | --- | --- |
-| `crates/claude-local/runtime/artifacts.mjs` | 存储、frame 文档/运行时、`/api/frame/*`、`/api/artifacts/mcp`、面板接口 |
-| `crates/claude-local/runtime/artifact-panel.js` | 注入到 claude.ai 页面的侧边面板（列表 + 预览 + 自动弹出） |
+| `crates/claude-local/runtime/artifacts.mjs` | 存储、frame 文档/运行时、`/api/frame/*`、`/api/artifacts/mcp`、本地调试接口 |
 | `crates/claude-local/runtime/conversation-service.mjs` | 给模型声明 artifact 工具，执行 tool_use 并回填 tool_result |
-| `crates/claude-local/runtime/proxy.mjs` | 路由：frame API、内容子域、MCP、面板脚本注入 |
+| `crates/claude-local/runtime/proxy.mjs` | 路由：frame API、内容子域、MCP |
 
 ## 存储
 
@@ -63,14 +60,11 @@ frame-runtime/
 
 缺省时 `/api/frame/artifacts`、`/api/frame/types` 仍可用，只是查看器页面取不到运行时。
 
-## 面板
+## 本地调试接口
 
-`artifact-panel.js` 以同源脚本注入页面（在 `</head>` 前），右下角出现
-「Artifacts」按钮：
-
-- 3 秒轮询 `/__claude_local/artifacts`，有新作品自动打开并提示；
-- 侧边抽屉列出作品，iframe 预览 `/<id>/raw`（优先 `project/index.html`）；
-- 「打开」在浏览器中查看，「关闭」/Esc 收起。
+`/__claude_local/artifacts` 仍保留在本地服务里（作品列表、
+`/<id>/raw` 预览、`/<id>/meta`），仅供调试；不再往页面注入浮动面板。
+作品的日常使用走官方 frame 查看器（`/code/artifact/<uuid>`）。
 
 ## 测试
 

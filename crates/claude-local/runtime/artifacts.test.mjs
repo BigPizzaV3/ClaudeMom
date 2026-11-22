@@ -113,7 +113,7 @@ test("frame API lists typed artifacts and creates from a type", async () => {  c
   assert.equal(service.artifacts.listArtifacts().length, 2);
 });
 
-test("panel endpoint, preview HTML and injection", async () => {
+test("local API: preview HTML and listing", async () => {
   const { artifactRoot, frameRoot } = fixture();
   const service = createArtifactService({ artifactRoot, frameRoot });
   const { id } = service.artifacts.createArtifact("design", "Preview");
@@ -127,14 +127,6 @@ test("panel endpoint, preview HTML and injection", async () => {
   const listRes = fakeRes();
   service.handleLocalApi("GET", new URL("https://claude.ai/__claude_local/artifacts"), {}, listRes);
   assert.equal(JSON.parse(listRes.body.toString("utf8")).artifacts.length, 1);
-
-  const panelRes = fakeRes();
-  service.handleLocalApi("GET", new URL("https://claude.ai/__claude_local/artifacts/panel.js"), {}, panelRes);
-  assert.match(panelRes.body.toString("utf8"), /claudeLocalArtifacts/);
-
-  const html = service.injectPanel("<html><head><title>x</title></head><body></body></html>");
-  assert.match(html, /panel\.js/);
-  assert.equal(service.injectPanel(html), html);
 });
 
 test("type slugs accept bare names", () => {

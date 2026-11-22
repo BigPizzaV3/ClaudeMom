@@ -14,9 +14,6 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
-
-const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 /** 官方内置类型。slug 是类型 UUID，前端用 slug 建实例，不要写成 "design"。 */
 const TYPES = {
@@ -873,20 +870,8 @@ export function createArtifactService({ artifactRoot, frameRoot, origin = "https
     return true;
   }
 
-  // ── 面板与本地 HTTP 接口 ───────────────────────────────────
-  // 注入到 claude.ai 页面里的同源接口：面板脚本、作品列表、预览 HTML。
-  let panelCache = null;
-  function panelScript() {
-    if (panelCache === null) {
-      try {
-        panelCache = fs.readFileSync(path.join(HERE, "artifact-panel.js"));
-      } catch {
-        panelCache = Buffer.from("/* artifact panel unavailable */");
-      }
-    }
-    return panelCache;
-  }
-
+  // ── 本地 HTTP 接口 ────────────────────────────────────────
+  // 同源调试接口：作品列表、预览 HTML。
   /** 预览用 HTML：优先 project/index.html，其次任意 html，再退到空白画板。 */
   function previewHtml(id) {
     const { latest } = latestOf(id);
@@ -928,10 +913,6 @@ a{display:inline-block;padding:9px 16px;border-radius:10px;background:#b4472e;co
   function handleLocalApi(method, url, req, res) {
     const p = url.pathname.replace(/\/+$/, "") || "/";
     if (method !== "GET" && method !== "HEAD") return false;
-    if (p === "/__claude_local/artifacts/panel.js") {
-      send(res, 200, "text/javascript; charset=utf-8", panelScript(), { "x-content-type-options": "nosniff" });
-      return true;
-    }
     if (p === "/__claude_local/artifacts") {
       json(res, { artifacts: listArtifacts() });
       return true;
@@ -950,16 +931,6 @@ a{display:inline-block;padding:9px 16px;border-radius:10px;background:#b4472e;co
       return true;
     }
     return false;
-  }
-
-  /** 往页面 HTML 里插入面板脚本（同源、放在 head 末尾，已插入过就不重复）。 */
-  function injectPanel(html) {
-    const source = Buffer.isBuffer(html) ? html.toString("utf8") : String(html || "");
-    if (source.includes("/__claude_local/artifacts/panel.js")) return source;
-    const tag = '<script src="/__claude_local/artifacts/panel.js" defer></script>';
-    const at = source.toLowerCase().lastIndexOf("</head>");
-    if (at < 0) return source + tag;
-    return source.slice(0, at) + tag + source.slice(at);
   }
 
   // ── /api/artifacts/mcp：claude-artifacts MCP ────────────────
@@ -1172,7 +1143,6 @@ a{display:inline-block;padding:9px 16px;border-radius:10px;background:#b4472e;co
     handleFrameApi,
     handleFrameHost,
     handleLocalApi,
-    injectPanel,
     serveViewerShell,
     handleMcp,
     chatTools,
