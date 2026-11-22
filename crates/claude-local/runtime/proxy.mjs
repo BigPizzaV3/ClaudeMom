@@ -28,11 +28,11 @@ import { fileURLToPath } from "node:url";
 import { ConnectorError, connectorRecord, createConnectorService } from "./connectors.mjs";
 import { createConversationService } from "./conversation-service.mjs";
 import { isPatchedStartupAsset, startupAssets } from "./scripts/patch-dictation-start.mjs";
-import { createGatewayStreamParser, createStateStore, gatewayBody, gatewayHttpError, gatewayModel, gatewayTarget, isPrivateFile, mergePoolModels, modelList, modelSelectors, isLocalNetworkHost, modelWindow, opencodeSessionHeaders, planProfile, requestSessionId, runtimeConfig } from "./runtime.mjs";
+import { createGatewayStreamParser, createStateStore, gatewayBody, gatewayHttpError, gatewayModel, gatewayTarget, isPrivateFile, mergePoolModels, modelList, modelSelectors, isLocalNetworkHost, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
 import { createOfficialAssets, loadCoworkSystemPrompt } from "./official-assets.mjs";
 import { EXTENSION_PREFIX, createExtensions } from "./extensions.mjs";
 import { DIRECTORY_MARKETPLACE, installablePlugin, installedDirectoryRecord, libraryItem, pluginRecord, pluginRepository, zipSubtree } from "./plugins.mjs";
-import { createBlobStore, createProjectApi, withProjectContext, withProjectMessages } from "./projects.mjs";
+import { createArtifactService } from "./artifacts.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const runtime = runtimeConfig();
@@ -445,6 +445,68 @@ function localI18n(pathname) {
 // ── 工具 ─────────────────────────────────────────────────────
 const now = () => new Date().toISOString();
 const log = (...a) => LOG && console.log(`[${now()}]`, ...a);
+// TEMP(debug)：本地联调时把请求与状态码写到 requests.log；文件不存在时不记录。
+// 排查完 Projects 弹窗的 loading 问题后删除。
+const DEBUG_REQUESTS = path.join(here, "requests.log");
+function traceRequest(req, url, res) {
+  let enabled = false;
+  try { enabled = fs.statSync(DEBUG_REQUESTS).isFile(); } catch {}
+  if (!enabled) return;
+  const line = `${now()} ${req.method} ${url.pathname}${url.search}`;
+  res.on("finish", () => {
+    try { fs.appendFileSync(DEBUG_REQUESTS, `${line} -> ${res.statusCode}\n`); } catch {}
+  });
+}
+
+// ── Artifacts（typed-artifact 本地实现）──────────────────────
+// 读写官方 Claude Desktop 的 typed-artifacts 目录：官方 Artifacts 页、Code/Cowork
+// 的 frame 查看器和聊天里的 artifact 卡片看到的是同一批作品。
+// frame 运行时来自本机录制，不放仓库；缺省读 <ClaudeMom 状态目录>/frame-runtime。
+const ARTIFACT_ROOT = process.env.CLAUDE_LOCAL_ARTIFACT_ROOT || path.join(
+  process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"),
+  "Claude", "typed-artifacts",
+  String(ACCOUNT.uuid).slice(0, 8), String(ORG.uuid).slice(0, 8),
+);
+const FRAME_ROOT = process.env.CLAUDE_LOCAL_FRAME_ROOT || path.join(here, "..", "frame-runtime");
+const artifactService = createArtifactService({
+  artifactRoot: ARTIFACT_ROOT,
+  frameRoot: FRAME_ROOT,
+  officialAssets,
+  localAccount: { uuid: ACCOUNT.uuid, name: ACCOUNT.name, email: ACCOUNT.email },
+  log,
+});
+// 页面外壳里注入本地 Artifact 面板（同源脚本，随壳一起出）。
+const OFFICIAL_SHELL_HTML = officialShell ? artifactService.injectPanel(officialShell) : null;
+const TEMPLATE_SHELL_HTML = TEMPLATE_SHELL ? artifactService.injectPanel(TEMPLATE_SHELL) : null;
+// Code 页面（/epitaxy）跳过内置的 bootstrap preload：preload 只把账号写进内存 store，
+// 不写 query cache；随后账号查询因为「已水合」被禁用，isPending 永远为 true，
+// 新建项目弹窗的 isAccountLoading 就一直等下去。跳过 preload 后查询走 /api/bootstrap 正常结束。
+const DEBUG_CLIENT_ERROR_SCRIPT = `<script>
+(function(){
+  function send(payload){try{fetch("/__client_error",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(payload)}).catch(function(){})}catch(e){}}
+  addEventListener("error",function(e){var t=e.target||{};send({kind:"error",message:String(e.message),source:String(e.filename)+":"+e.lineno+":"+e.colno,stack:String(e.error&&e.error.stack||""),tag:String(t.tagName||""),url:String(t.src||t.href||"")})},true);
+  addEventListener("unhandledrejection",function(e){send({kind:"rejection",message:String(e.reason&&(e.reason.message||e.reason)),stack:String(e.reason&&e.reason.stack||"")})});
+  // chunk 加载诊断：vite:preloadError（import 失败）与 ant:stylesheet-skipped（CSS 放弃）都只在 window 上派发一次
+  addEventListener("vite:preloadError",function(e){send({kind:"chunk",message:"vite:preloadError payload="+String(e.payload&&(e.payload.message||e.payload)),stack:""})});
+  addEventListener("ant:stylesheet-skipped",function(e){send({kind:"chunk",message:"ant:stylesheet-skipped href="+String(e.detail&&e.detail.href),stack:""})});
+  addEventListener("ant:import-healed",function(e){send({kind:"chunk-healed",message:"ant:import-healed repeats="+String(e.detail&&e.detail.repeat),stack:""})});
+})();
+</script>`;
+function withDebugScript(html) {
+  if (!html) return html;
+  const text = Buffer.isBuffer(html) ? html.toString("utf8") : html;
+  if (!/<head[^>]*>/i.test(text)) return html;
+  return Buffer.from(text.replace(/<head([^>]*)>/i, `<head$1>${DEBUG_CLIENT_ERROR_SCRIPT}`));
+}
+const TEMPLATE_SHELL_NO_PRELOAD_HTML = (() => {
+  if (!TEMPLATE_SHELL_HTML) return null;
+  const html = withDebugScript(TEMPLATE_SHELL_HTML).toString("utf8");
+  if (!/<head[^>]*>/i.test(html)) return null;
+  return Buffer.from(html.replace(
+    /<head([^>]*)>/i,
+    "<head$1><script>window.__SKIP_BOOTSTRAP_PRELOAD__=true;</script>",
+  ));
+})();
 
 // Chat 的 completion 请求体字段随客户端版本变化：从常见位置兜底取最近一条用户文本（跳过助手消息）。
 function firstUserText(value, depth = 0) {
@@ -530,27 +592,13 @@ const CONV_STATE = new Map();
 const NOTIFICATION_SETTINGS = new Map();
 const INSTALLED_PLUGINS = new Map(); // 插件 id → 安装时的目录记录
 const CONNECTORS = new Map(); // 连接器 uuid → 记录（见 connectors.mjs）
-const PROJECTS = new Map(); // 项目 uuid → 记录（见 projects.mjs）
 let DEVICE_ROW = null; // Code 模式注册的设备行 {id, k, ...}
 const stateStore = createStateStore(STATE_FILE, CONV_STATE, NOTIFICATION_SETTINGS, (warning) => {
   persistenceWarning = warning;
   console.error(warning);
-}, INSTALLED_PLUGINS, CONNECTORS, PROJECTS);
-const projectApi = createProjectApi({
-  projects: PROJECTS,
-  // 项目知识的正文和上传的文件放在状态文件旁边，不进状态文件。
-  blobs: createBlobStore(STATE_FILE ? path.join(path.dirname(STATE_FILE), "project-files") : null),
-  account: ACCOUNT,
-  changed: () => stateStore.flush(),
-  conversations: () => [...CONV_STATE.values()],
-  conversationRecord: (conv) => convToRest(conv),
-  removeConversation: (uuid) => CONV_STATE.delete(uuid),
-  json,
-  readBody,
-  decodeJsonBody,
-});
+}, INSTALLED_PLUGINS, CONNECTORS);
 
-function ensureConv(uuid) {
+function ensureConv(uuid, { chatProjectId } = {}) {
   if (!CONV_STATE.has(uuid)) {
     CONV_STATE.set(uuid, {
       uuid,
@@ -564,21 +612,29 @@ function ensureConv(uuid) {
       nextIndex: 0,
       leafMessageId: null,
       model: runtime.model,
+      // Code 会话归属的项目 uuid（/epitaxy/project/{id} 内发起的会话）；null = 不属于任何项目
+      chat_project_id: typeof chatProjectId === "string" && chatProjectId ? chatProjectId : null,
     });
     stateStore.changed();
   }
-  return CONV_STATE.get(uuid);
+  const conv = CONV_STATE.get(uuid);
+  // 项目内补建：会话已存在但没记项目归属时补上（StreamTimeline 先于 REST 创建到达的路径）
+  if (chatProjectId && !conv.chat_project_id) {
+    conv.chat_project_id = chatProjectId;
+    conv.updated_at = now();
+    stateStore.changed();
+  }
+  return conv;
 }
 
 // claudeai-rpc 服务：StreamTimeline / PerformAction / 其余 ConversationService 方法
 const conversationService = createConversationService({
   ensureConv,
   listConvs: () => [...CONV_STATE.values()],
+  artifacts: artifactService,
   log,
   onChange: (flush) => flush ? stateStore.flush() : stateStore.changed(),
   request: (target, options, callback) => gatewayRequest(target, options, callback),
-  projectContext: (conv) => projectApi.context(conv.project_uuid),
-  hasProject: (uuid) => projectApi.has(uuid),
 });
 
 function pushMessage(conv, msg) {
@@ -734,6 +790,58 @@ function normalizeAccountProfile(source = {}) {
   };
 }
 
+// 本地模式按 1P 最高档放开录制模板里被组织等级挡掉的功能。
+// 录制账号是受限账号（cowork、omelette、operon 等大量 blocked_by_org_tier），
+// 直接回放会让设置页缺 Cowork / Design system，相关的知识检索也不可用。
+// 只改已有条目的 status，不增删字段；未列出的 feature 原样保留。
+const FEATURE_OVERRIDES = {
+  cowork: "available",
+  cowork_browser_pane: "available",
+  cowork_remote_control: "available",
+  cowork_watch_record: "available",
+  omelette: "available",
+  operon: "available",
+  operon_memory: "available",
+  operon_custom_connectors: "available",
+  operon_custom_skills: "available",
+  operon_network_allowlist: "available",
+  operon_ssh_hosts: "available",
+  operon_modal: "available",
+  operon_model_endpoints: "available",
+  operon_local_work_import: "available",
+  operon_auto_mode: "available",
+  computer_use: "available",
+  work_across_apps: "available",
+  dittos: "available",
+  claude_code_remote_control: "available",
+  claude_code_fast_mode: "available",
+  claude_code_security: "available",
+  claude_code_routines: "available",
+  claude_browser_extension: "available",
+  project_knowledge_search: "available",
+  member_usage_dashboard: "available",
+  browser_data_import: "available",
+  academy_personalization: "available",
+  // Code 面板 Artifacts：侧边栏 gate=frame-gallery 只查 cobalt_plinth；
+  // 前端默认表把它判 blocked_by_platform，不给 available 入口都不出现。
+  // wiggle 用于 iframe 侧 send-to-partner（Am() 要求 chat+cobalt_plinth+wiggle 三件）。
+  // （chat 侧 artifacts / cowork 侧 cowork-artifacts 条目的 gate 是客户端布尔，非 feature。）
+  cobalt_plinth: "available",
+  wiggle: "available",
+  mcp_artifacts: "available",
+};
+function applyFeatureOverrides(access) {
+  if (!access || typeof access !== "object") return access;
+  const patch = (list) => Array.isArray(list)
+    ? list.map((entry) => {
+      if (!entry || typeof entry !== "object") return entry;
+      const status = FEATURE_OVERRIDES[entry.feature];
+      return status && entry.status !== status ? { ...entry, status } : entry;
+    })
+    : list;
+  return { ...access, features: patch(access.features), account_features: patch(access.account_features) };
+}
+
 function localUserAccess() {
   return {
     features: [],
@@ -787,6 +895,291 @@ function mockEdgeApi(req, res, url) {
   return json(res, {});
 }
 
+// ── Projects（1P 的 Projects / Code 项目列表）─────────────────────────────
+// 官方前端读写 /api/organizations/{org}/projects[_v2]，录制模板里没有这些数据。
+// 原先只有空分页兜底：列表能开但永远为空，创建时返回分页对象会让界面报错。
+// 这里给本地模式一套最小可用的持久化存储（projects.json 与 conversations.json 并列）。
+// 与 conversations.json 放在同一个状态目录（测试里是临时目录，避免污染仓库）。
+const PROJECTS_FILE = path.join(STATE_FILE ? path.dirname(STATE_FILE) : here, "projects.json");
+const PROJECTS = new Map();
+try {
+  if (fs.existsSync(PROJECTS_FILE)) {
+    const rows = JSON.parse(fs.readFileSync(PROJECTS_FILE, "utf8"));
+    if (Array.isArray(rows)) {
+      for (const row of rows) if (row && typeof row.uuid === "string") PROJECTS.set(row.uuid, row);
+    }
+  }
+} catch {}
+function saveProjects() {
+  try {
+    fs.writeFileSync(PROJECTS_FILE, JSON.stringify([...PROJECTS.values()], null, 2));
+  } catch (error) {
+    console.error("Local projects could not be saved:", error.message);
+  }
+}
+function projectRecord(body = {}) {
+  const ts = now();
+  const name = typeof body.name === "string" && body.name.trim()
+    ? body.name.trim().slice(0, 200) : "Untitled project";
+  const uuid = crypto.randomUUID();
+  return {
+    uuid,
+    // 前端部分列表适配器读 id；本地把它和 uuid 保持一致。
+    id: uuid,
+    name,
+    description: typeof body.description === "string" ? body.description : "",
+    instructions: typeof body.instructions === "string" ? body.instructions : "",
+    prompt_template: typeof body.prompt_template === "string" ? body.prompt_template : "",
+    is_starred: body.is_starred === true,
+    is_private: body.is_private !== false,
+    is_starter_project: false,
+    is_harmony_project: false,
+    type: body.type === undefined || body.type === null ? null : body.type,
+    settings: {},
+    permissions: [
+      "chat_project:chat:view", "chat_project:chat:create", "chat_project:members:manage",
+      "chat_project:owner:manage", "chat_project:knowledge:edit", "chat_project:knowledge:view",
+      "chat_project:delete", "chat_project:view", "chat_project:settings:edit",
+    ],
+    created_at: ts,
+    updated_at: ts,
+    last_activity_at: ts,
+    archived_at: null,
+    creator: {
+      uuid: ACCOUNT.uuid, name: ACCOUNT.name, full_name: ACCOUNT.name, email_address: ACCOUNT.email,
+    },
+  };
+}
+function projectsPage(url) {
+  const params = url.searchParams;
+  const limit = Math.min(Math.max(Number(params.get("limit")) || 30, 1), 100);
+  const offset = Math.max(Number(params.get("offset")) || 0, 0);
+  const uuids = params.getAll("uuids").filter(Boolean);
+  const starred = params.get("starred");
+  const archived = params.get("is_archived");
+  const type = params.get("type");
+  const creatorFilter = params.get("creator_filter") || params.get("creator") || params.get("filter");
+  const search = String(params.get("searchQuery") || params.get("search") || "").trim().toLowerCase();
+  let rows = [...PROJECTS.values()];
+  if (uuids.length) rows = rows.filter((row) => uuids.includes(row.uuid));
+  if (creatorFilter === "is_creator" || creatorFilter === "own") {
+    rows = rows.filter((row) => row.creator?.uuid === ACCOUNT.uuid);
+  }
+  if (starred === "true") rows = rows.filter((row) => row.is_starred);
+  if (archived === "true") rows = rows.filter((row) => row.archived_at);
+  else if (archived !== "all") rows = rows.filter((row) => !row.archived_at);
+  if (type) rows = rows.filter((row) => row.type === type);
+  if (search) rows = rows.filter((row) => `${row.name} ${row.description}`.toLowerCase().includes(search));
+  const orderBy = params.get("order_by") || "latest_activity";
+  rows.sort(orderBy === "name"
+    ? (a, b) => a.name.localeCompare(b.name)
+    : (a, b) => String(b.last_activity_at || b.updated_at).localeCompare(String(a.last_activity_at || a.updated_at)));
+  const data = rows.slice(offset, offset + limit);
+  return {
+    data,
+    items: data,
+    pagination: { has_more: offset + limit < rows.length, limit, offset, total: rows.length, next_cursor: null },
+  };
+}
+function projectView(project) {
+  return { ...project, prompt_template: project.prompt_template || "" };
+}
+function projectsApi(req, res, url, p) {
+  const match = p.match(/^\/api\/organizations\/([^/]+)\/projects(?:_v2)?(\/.*)?$/);
+  if (!match) return false;
+  const method = req.method;
+  const rest = match[2] || "";
+  const emptyPage = {
+    items: [], data: [], next_cursor: null, has_more: false, facets: null,
+    pagination: { has_more: false, next_cursor: null, cursor: null, limit: 30, offset: 0, total: 0 },
+  };
+  if (rest === "/count" && method === "GET") {
+    const rows = [...PROJECTS.values()].filter((row) => !row.archived_at);
+    return json(res, { count: rows.length }), true;
+  }
+  if (rest === "/request_haystack") return json(res, {}), true;
+  // 会话移动：把会话挪进/挪出项目。请求体 {conversation_uuids:[...], project_uuid: uuid|null}
+  // 放在 projectsApi 里，避免被通用的未知 sub 空分页分支吞掉。
+  if (rest === "/move_conversations" && method === "POST") {
+    return readBody(req, (raw) => {
+      const body = decodeJsonBody(req, raw);
+      const target = typeof body.project_uuid === "string" && body.project_uuid ? body.project_uuid : null;
+      const ids = Array.isArray(body.conversation_uuids) ? body.conversation_uuids : [];
+      for (const id of ids) {
+        if (CONV_STATE.has(id)) {
+          CONV_STATE.get(id).chat_project_id = target;
+          CONV_STATE.get(id).updated_at = now();
+        }
+      }
+      stateStore.flush();
+      json(res, { moved: ids.length, project_uuid: target });
+    }), true;
+  }
+  if (!rest) {
+    if (method === "GET") return json(res, projectsPage(url)), true;
+    if (method === "POST") {
+      readBody(req, (raw) => {
+        const body = decodeJsonBody(req, raw);
+        const project = projectRecord(body?.project ?? body ?? {});
+        PROJECTS.set(project.uuid, project);
+        saveProjects();
+        json(res, projectView(project), 201);
+      });
+      return true;
+    }
+    return json(res, emptyPage), true;
+  }
+  const tail = rest.match(/^\/([^/]+)(\/.*)?$/);
+  if (!tail) return json(res, emptyPage), true;
+  const uuid = tail[1];
+  const sub = tail[2] || "";
+  const project = PROJECTS.get(uuid);
+  if (sub === "/settings") {
+    if (method === "PATCH" || method === "PUT") {
+      readBody(req, (raw) => {
+        const body = decodeJsonBody(req, raw);
+        if (project) {
+          const patch = body?.project ?? body?.settings ?? body ?? {};
+          for (const key of ["name", "description", "instructions", "is_starred", "is_private", "archived_at"]) {
+            if (patch[key] !== undefined) project[key] = patch[key];
+          }
+          project.updated_at = now();
+          project.last_activity_at = project.updated_at;
+          saveProjects();
+        }
+        json(res, { settings: {} });
+      });
+      return true;
+    }
+    return json(res, { settings: {} }), true;
+  }
+  if (sub === "/kb/stats") return json(res, { documents: 0, files: 0, syncs: 0, conversations: 0, total_size: 0 }), true;
+  if (sub === "/conversations_v2") {
+    // 详情页预取三件套之一；data 必须是数组，否则前端进 fatal boundary。
+    // 返回归属本项目的本地会话（chat_project_id === 项目 uuid）。
+    const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 30, 1), 100);
+    const offset = Math.max(Number(url.searchParams.get("offset")) || 0, 0);
+    const rows = [...CONV_STATE.values()]
+      .filter((c) => c.chat_project_id === uuid)
+      .sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)));
+    const page = rows.slice(offset, offset + limit).map((c) => convToRest(c));
+    return json(res, {
+      data: page,
+      items: page,
+      pagination: { has_more: offset + limit < rows.length, next_cursor: null, limit, offset, total: rows.length },
+    }), true;
+  }
+  if (sub === "/accounts") {
+    return json(res, {
+      data: [{ account: { uuid: ACCOUNT.uuid, name: ACCOUNT.name, email_address: ACCOUNT.email }, role: "owner" }],
+      pagination: { has_more: false, next_cursor: null, limit: 30, offset: 0, total: 1 },
+    }), true;
+  }
+  if (sub === "/permissions") {
+    return json(res, [
+      "chat_project:chat:view", "chat_project:chat:create", "chat_project:members:manage",
+      "chat_project:owner:manage", "chat_project:knowledge:edit", "chat_project:knowledge:view",
+      "chat_project:delete", "chat_project:view", "chat_project:settings:edit",
+    ]), true;
+  }
+  if (sub === "/activity_v2") return json(res, emptyPage), true;
+  if (sub === "/accounts_bulk" || sub === "/groups_bulk" || sub === "/upload") return json(res, {}), true;
+  // 触发知识库重同步：回 done 状态避免前端把项目标记成"同步中"再轮询 /syncs。
+  if (sub === "/sync" && method === "POST") {
+    return json(res, { kb_resync_status: "done", gdrive_resource_backfill_triggered: false }), true;
+  }
+  if (sub === "/roles") return json(res, { group_assignments: [], data: [], items: [] }), true;
+  if (sub === "/docs" || sub === "/files") return json(res, emptyPage), true;
+  // /syncs 消费端要求顶层数组（Array.isArray 校验）；行带 kb_resync_status:"done"
+  // 避免 "in progress" 行驱动前端 5 秒轮询。
+  if (sub === "/syncs" && method === "GET") return json(res, []), true;
+  if (sub === "/syncs") return json(res, {}), true;
+  if (sub === "/report" && method === "POST") return json(res, { ok: true }), true;
+  if (sub) return json(res, emptyPage), true;
+  if (!project) {
+    if (method === "DELETE") { res.writeHead(204, { "content-length": 0 }); return res.end(), true; }
+    return json(res, { error: "not_found", message: "Project not found" }, 404), true;
+  }
+  if (method === "DELETE") {
+    PROJECTS.delete(uuid);
+    saveProjects();
+    res.writeHead(204, { "content-length": 0 });
+    return res.end(), true;
+  }
+  if (method === "PATCH" || method === "PUT") {
+    readBody(req, (raw) => {
+      const body = decodeJsonBody(req, raw);
+      const patch = body?.project ?? body ?? {};
+      for (const key of ["name", "description", "instructions", "prompt_template", "is_starred", "is_private", "type", "archived_at"]) {
+        if (patch[key] !== undefined) project[key] = patch[key];
+      }
+      // 归档/取消归档走 PUT {is_archived:true|false}，不是 archived_at。
+      if (patch.is_archived !== undefined) {
+        project.archived_at = patch.is_archived ? now() : null;
+        if (patch.is_archived) project.is_starred = false;
+      }
+      project.updated_at = now();
+      project.last_activity_at = project.updated_at;
+      saveProjects();
+      json(res, projectView(project));
+    });
+    return true;
+  }
+  // 详情响应：include_has_sync_sources 对应 has_sync_sources 布尔，include_counts=false
+  // 表示前端不要 counts 字段（本地无知识库，缺省即可）。
+  return json(res, { ...projectView(project), has_sync_sources: false }), true;
+}
+
+// 新建项目弹窗会拉 GitHub 仓库列表与 GitHub App 安装状态；这些请求如果转发上游，
+// 20 秒超时后会以未处理的 socket error 打崩整个 proxy。本地模式一律回空。
+// RUM / 事件上报同理，本地吞掉。
+function localCodeApi(req, res, url, p) {
+  if (p === "/api/v2/rum" || p.startsWith("/api/event_logging/")) {
+    json(res, {});
+    return true;
+  }
+  // /api/eval/*（Statsig/实验求值）：转发上游 403，前端 gate 求值失败会连带弹窗类组件
+  // 进入 failed 态。本地回空配置。
+  if (/^\/api\/eval\//.test(p)) {
+    json(res, {});
+    return true;
+  }
+  // frame 契约：转发上游 403，Artifacts/Frame 面板会报加载失败。本地回最小契约。
+  if (p === "/api/frame/contract/latest") {
+    json(res, { contract: null, version: null });
+    return true;
+  }
+  // 插件目录端点表与 Artifacts MCP 的 GET 探活（POST 走 artifactService.handleMcp）。
+  if (p === "/api/directory/server-urls") {
+    json(res, { claude_ai: "https://claude.ai", api: "https://api.anthropic.com" });
+    return true;
+  }
+  if (req.method === "GET" && p === "/api/artifacts/mcp") {
+    json(res, {});
+    return true;
+  }
+  if (/^\/api\/organizations\/[^/]+\/code\/repos$/.test(p)) {
+    json(res, {
+      repos: [], data: [], items: [],
+      pagination: { has_more: false, next_cursor: null, total: 0, limit: 100, offset: 0 },
+    });
+    return true;
+  }
+  if (/^\/api\/organizations\/[^/]+\/code\/repos\/resync$/.test(p)) {
+    json(res, { ok: true });
+    return true;
+  }
+  if (p === "/v1/code/github/org-connection/installations-status") {
+    json(res, { installations: [], org_connection: null, connected: false, viewer: null });
+    return true;
+  }
+  if (p === "/v1/code/mcp-config/prewarm") {
+    json(res, {});
+    return true;
+  }
+  return false;
+}
+
 // Cowork 总开关：GrowthBook 功能 `yukon_silver`，id 是功能名的 Java hashCode（574905726）。
 // 录制模板里它是 false，新版 Claude 因此只显示 Chat / Code。必须在模板合并之后改写，
 // 否则模板的 false 会盖掉。id 的算法跟模板走：只改写模板自带的 GrowthBook 表，
@@ -798,6 +1191,40 @@ function forceCowork(result, template) {
     ...result.org_growthbook,
     features: { ...result.org_growthbook.features, [COWORK_FEATURE_ID]: { defaultValue: true } },
   };
+}
+
+// Projects 总开关：GrowthBook 功能 `sink_planter_vase`（Java hashCode 1946445808）。
+// 录制模板里它是 false，1P 前端据此隐藏 Projects 入口；本地模式按最高档放开。
+// claude_ai_projects_limits（id 3704139687）模板里已有 {max_free_projects:5}，
+// 付费套餐不看这个上限，不需要改。
+const PROJECTS_FEATURE_ID = "1946445808";
+function forceProjects(result, template) {
+  if (!template?.org_growthbook?.features || !result.org_growthbook?.features) return;
+  result.org_growthbook = {
+    ...result.org_growthbook,
+    features: { ...result.org_growthbook.features, [PROJECTS_FEATURE_ID]: { defaultValue: true } },
+  };
+}
+
+// Code 面板的 Projects 入口由 GrowthBook 的 amber_tributary_* 开关控制：
+//   epitaxy-projects 的 gate = amber_tributary_heron && amber_tributary_osprey
+//   wren / ptarmigan 控制侧栏项目区块与归档视图。模板里全是 false，本地按最高档打开。
+const CODE_PROJECT_FLAGS = [
+  "amber_tributary_heron",
+  "amber_tributary_osprey",
+  "amber_tributary_wren",
+  "amber_tributary_ptarmigan",
+];
+function javaHashId(name) {
+  let hash = 0;
+  for (const ch of name) hash = (Math.imul(31, hash) + ch.charCodeAt(0)) | 0;
+  return String(hash >>> 0);
+}
+function forceCodeProjects(result) {
+  if (!result.org_growthbook?.features) return;
+  const features = { ...result.org_growthbook.features };
+  for (const name of CODE_PROJECT_FLAGS) features[javaHashId(name)] = { defaultValue: true };
+  result.org_growthbook = { ...result.org_growthbook, features };
 }
 
 // claude_ai_hub_web_delivery：Claude 的合并式主页，对话和 Cowork 合在一个输入框里，没有「对话 | Cowork」切换。
@@ -829,17 +1256,6 @@ function allowConnectorSignIn(result, template) {
   };
 }
 
-// 项目知识里能传图片：GrowthBook 功能 `project_image`（id 同样是功能名的 hashCode）。录制模板里是 false，
-// 知识面板就只收文档。图片由本地项目接口存下、对话时发给模型（见 projects.mjs）。
-const PROJECT_IMAGE_FEATURE_ID = "3346981045";
-function allowProjectImages(result, template) {
-  if (!template?.org_growthbook?.features || !result.org_growthbook?.features) return;
-  result.org_growthbook = {
-    ...result.org_growthbook,
-    features: { ...result.org_growthbook.features, [PROJECT_IMAGE_FEATURE_ID]: { defaultValue: true } },
-  };
-}
-
 let resolvedBootstrapCache;
 // 主页问候语里带着称呼：模板里是「Local User」（脱敏时换的），按设置里的用户名换掉。
 const TEMPLATE_DISPLAY_NAME = "Local User";
@@ -861,6 +1277,8 @@ function resolvedBootstrap() {
     ...localBootstrap(), ...structuredClone(template),
     intercom_account_hash: null, intercom_user_jwt: null,
   });
+  // 模板合并之后覆盖，否则模板里的 blocked_by_org_tier 会盖掉。
+  result.current_user_access = applyFeatureOverrides(result.current_user_access);
   result.served_copy = {
     ...result.served_copy,
     "web.plan_name.max_20x": runtime.localization ? "Codex++ 本地网关" : "Codex++ local gateway",
@@ -872,10 +1290,10 @@ function resolvedBootstrap() {
     result.system_prompts = { ...result.system_prompts, ...coworkSystemPrompts() };
     forceCowork(result, template);
   }
+  forceProjects(result, template);
+  forceCodeProjects(result);
   if (!runtime.hubHome) useClassicHome(result, template);
   allowConnectorSignIn(result, template);
-  allowProjectImages(result, template);
-  result.gated_messages = withProjectMessages(result.gated_messages);
   if (useOfficialShell) {
     // 模板里的 gated_imports 是录制时线上版本的分块清单，与本机外壳对不上：换成本机版本。
     result.gated_imports = {};
@@ -895,47 +1313,6 @@ let REST_CONV_TEMPLATE = null;
 function offlineSkills(data) {
   if (!Array.isArray(data?.skills)) return data;
   return { ...data, skills: data.skills.map((skill) => ({ ...skill, enabled: false })) };
-}
-
-// 记忆（#43）：本地网关没有记忆合成，模型请求也不带记忆。这里只让设置页读写的形状对得上
-// （{} 会被 zod 判为缺 memory / controls / updated_at，报「无法保存记忆」），改动在本次运行内保留。
-let MEMORY_SETTINGS;
-function memorySettings() {
-  if (!MEMORY_SETTINGS) {
-    try {
-      if (!dataManaged) MEMORY_SETTINGS = JSON.parse(fs.readFileSync(path.join(POC_MOCK, "api", "memory_settings.json"), "utf8"));
-    } catch {}
-    MEMORY_SETTINGS ??= {
-      enabled_saffron: null, enabled_saffron_search: false, enabled_melange: null,
-      memory_mode: "melange", classic_mode_available: false,
-      melange_available: false, melange_imported_at: null,
-    };
-  }
-  return MEMORY_SETTINGS;
-}
-/** memory_mode 按客户端乐观更新的同一套规则推算。 */
-function updateMemorySettings(body) {
-  const settings = memorySettings();
-  for (const key of ["enabled_saffron", "enabled_saffron_search", "enabled_melange"]) {
-    if (typeof body[key] === "boolean") settings[key] = body[key];
-  }
-  if ("enabled_melange" in body) {
-    settings.memory_mode = body.enabled_melange === true ? "melange" : body.enabled_saffron === true ? "classic" : "off";
-  } else if ("enabled_saffron" in body && settings.memory_mode !== "melange") {
-    settings.memory_mode = body.enabled_saffron === true ? "classic" : "off";
-  }
-  if (body.clear_data === true) setMemoryControls(null);
-  return settings;
-}
-const MEMORY = {
-  memory: "", controls: null, updated_at: null,
-  controls_version: null, project_import: null, project_memory_mode: null,
-};
-function setMemoryControls(controls) {
-  MEMORY.controls = controls?.length ? controls : null;
-  MEMORY.memory = (controls ?? []).map((c) => `- ${c}`).join("\n");
-  MEMORY.controls_version = controls ? crypto.randomUUID() : null;
-  MEMORY.updated_at = controls ? now() : null;
 }
 
 function restTime(value, fallback) {
@@ -967,8 +1344,20 @@ function restMessages(c) {
     });
     messages.push(entry(turn.humanId, "human", turn.humanIndex, turn.humanParent, turn.prompt || ""));
     if (turn.complete || turn.text) {
+      // artifact 工具调用：把 tool_use / tool_result 放进内容块，前端据此渲染 artifact 卡片。
+      const content = [];
+      if (turn.text) content.push({ type: "text", text: turn.text, citations: [] });
+      for (const call of turn.toolCalls || []) {
+        content.push({ type: "tool_use", id: call.id, name: call.name, input: call.input ?? {} });
+        content.push({
+          type: "tool_result",
+          tool_use_id: call.id,
+          content: [{ type: "text", text: call.result ?? "" }],
+        });
+      }
+      if (!content.length) content.push({ type: "text", text: turn.text || "", citations: [] });
       messages.push(entry(turn.asstId, "assistant", turn.asstIndex, turn.humanId, turn.text || "",
-        turn.complete ? { stop_reason: turn.stopReason === "error" ? "error" : "end_turn" } : {}));
+        { content, ...(turn.complete ? { stop_reason: turn.stopReason === "error" ? "error" : "end_turn" } : {}) }));
     }
   }
   return messages;
@@ -984,14 +1373,11 @@ function convToRest(c, { messages = false } = {}) {
   }
   const live = c.turns?.some((t) => !t.complete);
   const title = c.name && c.name !== "New conversation" ? c.name : "";
-  const project = c.project_uuid ? PROJECTS.get(c.project_uuid) : undefined;
   return {
     ...REST_CONV_TEMPLATE,
     // 新版前端会对这些字段直接调用数组/对象操作；录制的 conversations.json 可能为空，
     // 而旧模板字段也可能是 null，因此本地 API 必须保证返回正确形状。
     settings: REST_CONV_TEMPLATE.settings && typeof REST_CONV_TEMPLATE.settings === "object" ? REST_CONV_TEMPLATE.settings : {},
-    project_uuid: project ? project.uuid : null,
-    ...(project ? { project: { uuid: project.uuid, name: project.name } } : {}),
     is_starred: REST_CONV_TEMPLATE.is_starred ?? false,
     is_archived: REST_CONV_TEMPLATE.is_archived ?? false,
     files: Array.isArray(REST_CONV_TEMPLATE.files) ? REST_CONV_TEMPLATE.files : [],
@@ -1001,6 +1387,9 @@ function convToRest(c, { messages = false } = {}) {
     name: title,
     summary: title,
     model: c.model || runtime.model,
+    // Code 会话行必须带项目归属；project_uuid 是 Chat 侧字段，同值双发保持两条消费路径兼容
+    chat_project_id: c.chat_project_id ?? null,
+    project_uuid: c.chat_project_id ?? REST_CONV_TEMPLATE.project_uuid ?? null,
     created_at: c.created_at,
     updated_at: c.updated_at,
     current_leaf_message_uuid: c.leafMessageId || c.current_leaf_message_uuid || null,
@@ -1038,7 +1427,7 @@ function sanitizeGeneratedTitle(raw) {
   return line.length > 80 ? `${line.slice(0, 80)}…` : line;
 }
 
-function generateSessionTitle(rawText, requestedModel, emptyFallback, callback, sessionId) {
+function generateSessionTitle(rawText, requestedModel, emptyFallback, callback) {
   const input = extractTitleInput(rawText);
   const fallback = fallbackSessionTitle(input, emptyFallback);
   if (!input) return callback(fallback);
@@ -1077,7 +1466,6 @@ function generateSessionTitle(rawText, requestedModel, emptyFallback, callback, 
         "x-api-key": runtime.key,
         authorization: `Bearer ${runtime.key}`,
         "anthropic-version": "2023-06-01",
-        ...opencodeSessionHeaders(target, () => sessionId),
       },
       // 网关在跑长任务时首字可能排队：标题生成等久一点，别退回“截断提示词”。
       timeout: 20000,
@@ -1107,6 +1495,20 @@ function generateSessionTitle(rawText, requestedModel, emptyFallback, callback, 
 function mockApi(req, res, url) {
   const p = url.pathname.replace(/\/+$/, "");
   const method = req.method;
+
+  // Artifacts：frame 列表/类型/文档/新建 和 claude-artifacts MCP。
+  // 必须在通用 /api/frame/* 兜底之前，否则会先落到空 pageShape。
+  if (artifactService.handleFrameApi(method, url, req, res)) return;
+  if (method === "POST" && p === "/api/artifacts/mcp") return artifactService.handleMcp(req, res);
+
+  // Claude Code CLI / Code 面板的 bootstrap 也会打到 claude.ai 这一侧。
+  // 不本地接住会落到上游 claude.ai 并得到 403，Code 面板会一直等账号/配置就绪。
+  if (/^\/api\/claude_cli\/bootstrap/.test(p)) {
+    return json(res, { client_data: {}, settings: {}, config: {}, enabled: true, environments: [], sessions: [], plugins: [], items: [], data: [] });
+  }
+  if (/^\/api\/claude_cli\//.test(p)) {
+    return json(res, { settings: {}, config: {}, enabled: true, data: [], items: [], sessions: [], environments: [] });
+  }
 
   // Code 的上下文来自 CLI model_selector，不读取网页的 hard_limit。
   const selector = p.match(/^\/api\/(?:organizations\/[^/]+\/)?model_selector\/([^/]+)$/);
@@ -1140,29 +1542,12 @@ function mockApi(req, res, url) {
     return json(res, { ...base, data: merged });
   }
 
-  if (/^\/api\/organizations\/[^/]+\/memory\/settings$/.test(p)) {
-    if (method === "GET") return json(res, memorySettings());
-    return readBody(req, (raw) => json(res, updateMemorySettings(decodeJsonBody(req, raw))));
-  }
-  const memoryMatch = p.match(/^\/api\/organizations\/[^/]+\/memory(?:\/(controls|synthesize|reset))?$/);
-  if (memoryMatch) {
-    if (method === "GET" || memoryMatch[1] === "synthesize") return json(res, MEMORY);
-    return readBody(req, (raw) => {
-      const body = decodeJsonBody(req, raw);
-      if (memoryMatch[1] === "controls" && Array.isArray(body.controls)) {
-        setMemoryControls(body.controls.filter((c) => typeof c === "string"));
-      } else if (memoryMatch[1] === "reset") {
-        setMemoryControls(null);
-      }
-      json(res, MEMORY);
-    });
-  }
-
   // 录制下来的真实接口形状（mock/api/*.json）
   const apiMap = [
     [/\/reflections\/settings$/, "reflections_settings"],
     [/\/user_settings$/, "claude_code_user_settings"],
     [/\/mcp\/remote_servers_with_connection$/, "mcp_servers"],
+    [/\/memory\/settings$/, "memory_settings"],
     [/^\/api\/account_profile$/, "account_profile"],
     [/\/trial_status$/, "trial_status"],
     [/\/skills\/list-skills$/, "skills"],
@@ -1188,6 +1573,11 @@ function mockApi(req, res, url) {
             checksum: "local-1", content: { entries: {} },
           },
           mcp_servers: [],
+          memory_settings: {
+            enabled_saffron: null, enabled_saffron_search: false, enabled_melange: null,
+            memory_mode: "melange", classic_mode_available: false,
+            melange_available: false, melange_imported_at: null,
+          },
           account_profile: {
             work_function: "", conversation_preferences: null, cowork_global_instructions: null,
             cowork_instructions_union: false, conversation_preferences_cloud_max_chars: 10000,
@@ -1271,9 +1661,7 @@ function mockApi(req, res, url) {
   if (method === "GET" && /^\/api\/organizations\/[^/]+\/user_artifacts\/count$/.test(p)) {
     return json(res, { count: 0 });
   }
-  if (method === "GET" && /^\/api\/frame\/frames(?:\/external)?$/.test(p)) {
-    return json(res, { frames: [] });
-  }
+  // /api/frame/frames[/external] 由 artifactService.handleFrameApi 处理（mockApi 开头已调用）。
   const notifications = p.match(/^\/api\/organizations\/([^/]+)\/notification\/preferences$/);
   if (notifications && (method === "GET" || method === "PATCH")) {
     const org = notifications[1];
@@ -1323,7 +1711,6 @@ function mockApi(req, res, url) {
   }
   if (pluginApi(req, res, url, p)) return;
   if (connectorApi(req, res, url, p)) return;
-  if (projectApi.handle(req, res, url, p)) return;
 
   // 分页/列表类接口：客户端会 flatMap 取 .items/.data，回 {} 会出 [undefined] 元素
   // → render 时 TypeError 进 fatal boundary（0NV6PUA 崩溃页的来源）
@@ -1333,6 +1720,8 @@ function mockApi(req, res, url) {
     pagination: { has_more: false, next_cursor: null, cursor: null },
   };
   if (/\/library(\/|$)/.test(p)) return json(res, pageShape);
+  if (projectsApi(req, res, url, p)) return;
+  if (localCodeApi(req, res, url, p)) return;
   // Code 模式 OAuth：刷新 token（被通用 /v1/ 兜底吃掉会导致 stale_relogin 常驻）
   if (p === "/v1/oauth/token" && req.method === "POST") {
     return json(res, {
@@ -1360,6 +1749,58 @@ function mockApi(req, res, url) {
     res.on("close", () => clearInterval(ka));
     return;
   }
+  // ── Code 会话列表（/v1/code/sessions）：支持 chat_project_id 过滤 ──
+  // 项目详情页/侧边栏按项目拉会话；响应行带 chat_project_id。前端把 sessions/data 都当数组消费。
+  if (/^\/v1\/code\/sessions$/.test(p) && method === "GET" && url.searchParams.get("chat_project_id")) {
+    const projectId = url.searchParams.get("chat_project_id");
+    const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 30, 1), 100);
+    const cursor = Number(url.searchParams.get("cursor")) || 0;
+    const rows = [...CONV_STATE.values()]
+      .filter((c) => c.chat_project_id === projectId)
+      .sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)));
+    const page = rows.slice(cursor, cursor + limit);
+    const sessionRow = (c) => ({
+      id: c.uuid,
+      uuid: c.uuid,
+      session_id: c.uuid,
+      name: c.name || "New task",
+      title: c.name || "New task",
+      chat_project_id: c.chat_project_id ?? null,
+      project_uuid: c.chat_project_id ?? null,
+      session_status: c.turns?.some((t) => !t.complete) ? "running" : "idle",
+      status: c.turns?.some((t) => !t.complete) ? "running" : "idle",
+      lifecycle_status: c.turns?.some((t) => !t.complete) ? "running" : "idle",
+      created_at: c.created_at,
+      updated_at: c.updated_at,
+      model: c.model || runtime.model,
+    });
+    const shaped = page.map(sessionRow);
+    return json(res, {
+      sessions: shaped,
+      data: shaped,
+      items: shaped,
+      next_cursor: cursor + limit < rows.length ? String(cursor + limit) : null,
+      has_more: cursor + limit < rows.length,
+    });
+  }
+  // 会话移动的另一个可能形状 /projects/move_conversations 已在 projectsApi 内处理；
+  // 这里保留独立路径以防前端把它打在组织层之外（以日志捕获为准）。
+  if (method === "POST" && /\/move_conversations$/.test(p) && !/\/projects\/move_conversations$/.test(p)) {
+    return readBody(req, (raw) => {
+      const body = decodeJsonBody(req, raw);
+      const target = typeof body.project_uuid === "string" && body.project_uuid ? body.project_uuid : null;
+      const ids = Array.isArray(body.conversation_uuids) ? body.conversation_uuids : [];
+      for (const id of ids) {
+        if (CONV_STATE.has(id)) {
+          CONV_STATE.get(id).chat_project_id = target;
+          CONV_STATE.get(id).updated_at = now();
+        }
+      }
+      stateStore.flush();
+      json(res, { moved: ids.length, project_uuid: target });
+    });
+  }
+
   // 代码会话/环境（epitaxy 路由）：(n ?? Ra).filter 要求字段为数组
   if (/^\/v1\//.test(p)) {
     return json(res, {
@@ -1370,7 +1811,7 @@ function mockApi(req, res, url) {
   if (/\/marketplaces\//.test(p)) {
     return json(res, { ...pageShape, marketplaces: [] });
   }
-  if (method === "GET" && p === "/api/frame/types") return json(res, { ...pageShape, types: [] });
+  // /api/frame/* 已由 artifactService.handleFrameApi 处理；这里只兜未知子路径（pageShape 空结构）。
   if (p.startsWith("/api/frame/")) return json(res, pageShape);
   if (method === "GET" && /^\/api\/organizations\/[^/]+\/plugins\/registry$/.test(p)) return json(res, { data: [] });
   // 客户端按 plugin id 读取元数据字典，每个值都必须是对象。
@@ -1425,6 +1866,7 @@ function mockApi(req, res, url) {
     if (!dataManaged) {
       try { base = JSON.parse(fs.readFileSync(path.join(POC_MOCK, "bootstrap.json"), "utf8")).current_user_access ?? base; } catch {}
     }
+    base = applyFeatureOverrides(base);
     return jsonWithActiveOrg(res, {
       ...base,
       has_access: true,
@@ -1468,6 +1910,10 @@ function mockApi(req, res, url) {
   }
   if (p === "/api/organizations") {
     return jsonWithActiveOrg(res, { organizations: [ORG], data: [ORG], items: [ORG] });
+  }
+  // org 级别的设置/记忆/skills 端点：未覆盖的通用 mock 形状会触发前端 parse 失败 notice
+  if (/\/memory\/settings/.test(p)) {
+    return json(res, { settings: {}, entries: [], items: [] });
   }
   if (/\/skills\/download-dot-skill-file/.test(p)) {
     // 技能内容在 Anthropic 服务器上，本地拿不到。列表里已经都标成未启用（offlineSkills），
@@ -1524,11 +1970,13 @@ function mockApi(req, res, url) {
         const requestedId = typeof body.uuid === "string" && /^[0-9a-f-]{36}$/i.test(body.uuid)
           ? body.uuid
           : crypto.randomUUID();
-        const conv = ensureConv(requestedId);
-        if (projectApi.has(body.project_uuid)) {
-          conv.project_uuid = body.project_uuid;
-          stateStore.flush();
-        }
+        // 项目详情页新建会话时前端会带 project_uuid / chat_project_id / project 字段
+        const chatProjectId = typeof body.chat_project_id === "string" && body.chat_project_id
+          ? body.chat_project_id
+          : typeof body.project_uuid === "string" && body.project_uuid
+            ? body.project_uuid
+            : null;
+        const conv = ensureConv(requestedId, { chatProjectId });
         if (typeof body.name === "string" && body.name.trim()) {
           conv.name = body.name.trim().slice(0, 200);
           conv.updated_at = now();
@@ -1554,7 +2002,7 @@ function mockApi(req, res, url) {
           stateStore.flush();
         }
         json(res, { title });
-      }, convTitleMatch[1]);
+      });
     });
   }
   const convMatch = p.match(/\/chat_conversations\/([^/]+)$/);
@@ -1599,12 +2047,6 @@ function mockApi(req, res, url) {
         conv.model = model;
         stateStore.changed();
       }
-      // 网页版不单独建会话：第一条消息的 create_conversation_params 里带着项目。
-      const projectUuid = body.create_conversation_params?.project_uuid;
-      if (conv && !conv.project_uuid && projectApi.has(projectUuid)) {
-        conv.project_uuid = projectUuid;
-        stateStore.changed();
-      }
       const sendEv = (ev, obj) => {
         res.write(`event: ${ev}\ndata: ${JSON.stringify(obj)}\n\n`);
       };
@@ -1640,14 +2082,14 @@ function mockApi(req, res, url) {
         sendEv("message_stop", { type: "message_stop" });
         res.end();
       };
-      const payload = JSON.stringify(withProjectContext({
+      const payload = JSON.stringify({
         model,
         max_tokens: 4096,
         stream: true,
         messages: conv ? conv.chat_messages.map((message) => ({
           role: message.sender === "human" ? "user" : "assistant", content: message.text,
         })) : [{ role: "user", content: prompt }],
-      }, projectApi.context(conv?.project_uuid)));
+      });
       const target = gatewayTarget(runtime, "/v1/messages");
       const greq = gatewayRequest(
         target,
@@ -1662,7 +2104,6 @@ function mockApi(req, res, url) {
             authorization: `Bearer ${runtime.key}`,
             "anthropic-version": "2023-06-01",
             accept: "text/event-stream",
-            ...opencodeSessionHeaders(target, () => convUuid),
           },
         },
         (gres) => {
@@ -1754,7 +2195,7 @@ function isHashedStaticAsset(req, url) {
   const prefix = url.hostname === "assets-proxy.anthropic.com" ? "/claude-ai/v2/assets/"
     : /^(?:www\.)?claude\.(?:ai|com)$/.test(url.hostname) ? "/assets/" : null;
   return prefix !== null && url.pathname.startsWith(prefix) &&
-    /\/[^/]+-[A-Za-z0-9_-]{8,}\.(?:m?js|css|wasm|woff2?|ttf|otf|png|jpe?g|webp|gif|svg|ico)$/.test(url.pathname);
+    /\/[^/]+-[A-Za-z0-9_-]{8,}\.(?:m?js|css|wasm|woff2?|ttf|otf|png|jpe?g|webp|gif|svg|ico|json)$/.test(url.pathname);
 }
 
 function withoutHopByHop(headers) {
@@ -1789,7 +2230,52 @@ function serveCachedStaticAsset(req, res, url) {
     if (meta.status !== 200 || meta.url !== cacheKey ||
         typeof meta.headers?.["content-type"] !== "string" ||
         /\b(?:private|no-store)\b/i.test(String(meta.headers["cache-control"] || ""))) return false;
-    const body = fs.readFileSync(cp);
+    let body = fs.readFileSync(cp);
+    // TEMP(debug)：新版客户端 + 录制的旧模板混用时，账号 provider 的 loading 不会结束，
+    // 新建项目弹窗的按钮一直置灰。这里把弹窗模块里的 isAccountLoading 强制为 false，
+    // 先验证创建链路；找到 provider 的真正原因后再删掉。
+    if (/\/c4a0274e5-[^/]+\.js$/.test(url.pathname) || /\/cf0b6cdd1-[^/]+\.js$/.test(url.pathname)) {
+      let bytes = body;
+      const encoding = String(meta.headers?.["content-encoding"] || "").toLowerCase();
+      try {
+        if (encoding.includes("gzip")) bytes = zlib.gunzipSync(body);
+        else if (encoding.includes("br")) bytes = zlib.brotliDecompressSync(body);
+        else if (encoding.includes("deflate")) bytes = zlib.inflateSync(body);
+      } catch {}
+      const source = bytes.toString("utf8");
+      let patched = source;
+      if (patched.includes("isAccountLoading:")) {
+        // 只改父组件向下传的 prop（形如 `isSubmitting:H,isAccountLoading:Lt,dialogLook:q}`），
+        // 不动解构赋值里的 `isAccountLoading:o}`，否则模块本身会语法错误。
+        patched = patched.replace(
+          /isSubmitting:([A-Za-z0-9_$]+),isAccountLoading:[A-Za-z0-9_$]+,dialogLook:([A-Za-z0-9_$]+)(?!\}=)/g,
+          "isSubmitting:$1,isAccountLoading:!1,dialogLook:$2",
+        );
+      }
+      // 6.x 的创建项目弹窗：提交按钮 disabled 由一个组合条件 `ap=!fd||En||ai` 决定，
+      // 本地模式下前置数据永远不齐，先强制可提交以验证创建链路。
+      patched = patched.replace("ap=!fd||En||ai", "ap=!1");
+      // 旧版(模板 build)的提交守卫：onClick:Xd 里 `if(!Jd)` 才动作，Jd=!fd||Al||_n||En。
+      // fd 依赖的 environments/account 查询在本地模式永远不齐 → Jd 恒 true → 点了没反应。
+      // 强制 Jd=false 让 requestSubmit()/Yd() 走通。
+      patched = patched.replace("Jd=!fd||Al||_n||En", "Jd=!1");
+      // gd(真正提交)的 guard 里有 !rl（environments 查询 loading），本地永远 true，同样放宽。
+      patched = patched.replace("cs||!rl||", "cs||");
+      if (patched !== source) {
+        body = Buffer.from(patched);
+        const headers = {
+          "content-type": "text/javascript; charset=utf-8",
+          "content-length": body.length,
+          "cache-control": "no-store",
+          // 跨域 ESM import（claude.ai 页面 → assets-proxy 模块）必须带 CORS 头，
+          // 否则 Chromium 报 "Failed to fetch dynamically imported module"（Qr 重试 4 次后放弃）。
+          "access-control-allow-origin": "*",
+        };
+        res.writeHead(200, headers);
+        res.end(body);
+        return true;
+      }
+    }
     const headers = bufferedResponseHeaders(meta.headers, body.length);
     delete headers["set-cookie"];
     res.writeHead(200, headers);
@@ -1851,13 +2337,13 @@ function serveDocShell(req, res, url) {
   const host = url.host || "claude.ai";
   const shell = readDocShell(host);
   if (shell) {
-    const cached = addExtensions(shell);
+    const body = Buffer.from(artifactService.injectPanel(addExtensions(shell)), "utf8");
     res.writeHead(200, {
       "content-type": "text/html; charset=utf-8",
-      "content-length": cached.length,
+      "content-length": body.length,
       "cache-control": "no-store",
     });
-    return res.end(cached);
+    return res.end(body);
   }
   const base = UPSTREAM_MAP[host] || `https://${host}`;
   const target = new URL("/epitaxy", base);
@@ -1888,11 +2374,12 @@ function serveDocShell(req, res, url) {
           );
         }
         const page = r.statusCode === 200 && !r.headers["content-encoding"] ? addExtensions(body) : body;
+        const html = Buffer.from(artifactService.injectPanel(page), "utf8");
         res.writeHead(r.statusCode || 502, {
           "content-type": "text/html; charset=utf-8",
-          "content-length": page.length,
+          "content-length": html.length,
         });
-        res.end(page);
+        res.end(html);
       });
     },
   );
@@ -1913,7 +2400,6 @@ function forwardGateway(req, res, requestPath, raw) {
   }
   const target = gatewayTarget(runtime, requestPath);
   const headers = {
-    ...opencodeSessionHeaders(target, () => requestSessionId(req.headers, body)),
     ...req.headers, host: target.host, "content-length": body.length,
     "x-api-key": runtime.key, authorization: `Bearer ${runtime.key}`,
   };
@@ -2197,6 +2683,9 @@ function proxyUpstream(req, res, url) {
     res.writeHead(502, upstreamFailureHeaders(req));
     res.end(`upstream unavailable: ${err.message}\n`);
   });
+  // 超时 destroy 会让底层 TLSSocket 在请求结束后再 emit 一次 error：
+  // 没有 socket 级监听时 Node 会把它当未处理错误，整个 proxy 直接退出。
+  upstreamReq.on("socket", (socket) => socket.on("error", () => {}));
   req.pipe(upstreamReq);
 }
 
@@ -2622,9 +3111,46 @@ function handle(req, res, hostHeader) {
   const url = new URL(req.url, `https://${host}`);
   noteClient();
   log(`${req.method} ${url.pathname}`);
+  traceRequest(req, url, res);
 
   const hostName = url.hostname.toLowerCase();
   const isMainClaudeHost = /^(claude\.ai|www\.claude\.ai|claude\.com|www\.claude\.com)$/.test(hostName);
+
+  // TEMP(debug)：页面注入的全局错误上报，写到 requests.log 方便定位弹窗加载失败。
+  if (req.method === "POST" && url.pathname === "/__client_error") {
+    return readBody(req, (raw) => {
+      try {
+        fs.appendFileSync(path.join(here, "requests.log"), `${now()} CLIENT-ERROR ${raw.toString("utf8").slice(0, 4000)}\n`);
+      } catch {}
+      res.writeHead(204, { "content-length": 0 });
+      res.end();
+    });
+  }
+
+  // Artifacts：MCP 端点不分域名（CLI 可能走 claude.ai 或 api.anthropic.com）。
+  if (req.method === "POST" && url.pathname === "/api/artifacts/mcp") {
+    return artifactService.handleMcp(req, res);
+  }
+  // 作品内容子域：<uuid>.claudeusercontent.com 的 _f/<ver>/* 与 _runtime/*。
+  if (/(^|\.)claudeusercontent\.com$/i.test(hostName)) {
+    return artifactService.handleFrameHost(req, res, url, hostName);
+  }
+  // 本地 Artifact 面板的同源接口（面板脚本、列表、预览）。
+  if (isMainClaudeHost && url.pathname.startsWith("/__claude_local/artifacts")) {
+    if (artifactService.handleLocalApi(req.method, url, req, res)) return;
+  }
+  // 查看器外壳：iframe / product=viewer 的 /code/artifact/<uuid>，以及短链 /artifact/<short>。
+  if (
+    isMainClaudeHost &&
+    (req.method === "GET" || req.method === "HEAD") &&
+    /^\/(?:code\/(?:artifact|frame)|artifact)\/[0-9A-Za-z_-]{8,36}$/.test(url.pathname) &&
+    (url.searchParams.get("product") === "viewer" ||
+      req.headers["sec-fetch-dest"] === "iframe" ||
+      url.pathname.startsWith("/artifact/"))
+  ) {
+    return artifactService.serveViewerShell(req, res, url);
+  }
+
   if (MODE === "mock" && req.method === "GET" &&
       (isMainClaudeHost || hostName === "api.anthropic.com") &&
       /^\/api\/(?:organizations\/[^/]+\/)?model_selector\/[^/]+\/?$/.test(url.pathname)) {
@@ -2752,12 +3278,13 @@ function handle(req, res, hostHeader) {
     !/^\/(?:api|edge-api|v1|claudeai-rpc)(?:\/|$)/.test(url.pathname)
   ) {
     const shell = addExtensions(officialShell);
+    const withPanel = artifactService.injectPanel(shell);
     res.writeHead(200, {
       "content-type": "text/html; charset=utf-8",
-      "content-length": Buffer.byteLength(shell),
+      "content-length": Buffer.byteLength(withPanel),
       "cache-control": "no-cache",
     });
-    return res.end(shell);
+    return res.end(withPanel);
   }
 
   if (
@@ -2797,6 +3324,23 @@ function handle(req, res, hostHeader) {
         return res.end(body);
       }
     }
+  }
+
+  // isolated-segment.html：前端 IsolatedMarketingPixelSegmentProvider 的分析像素 iframe
+  // （shared-l-p-m-w-5: `https://a.claude.ai/isolated-segment.html?v=${buildId}`）。域名是
+  // a.claude.ai（不在主站白名单内，会落进下面的非主站直通分支），转发上游会 302 到
+  // app-unavailable-in-region。必须在非主站分支**之前**截住。回最小空文档让 iframe 正常加载。
+  if (MODE === "mock" && /^\/(?:isolated-segment|sealed-entry)\.html$/.test(url.pathname) &&
+      /(^|\.)claude\.(ai|com)$/i.test(hostName)) {
+    const stub = "<!doctype html><html lang=\"en\"><head><meta charset=\"UTF-8\">" +
+      "<title>segment</title><style>html,body{margin:0;padding:0;background:transparent}</style>" +
+      "</head><body></body></html>";
+    res.writeHead(200, {
+      "content-type": "text/html; charset=utf-8",
+      "content-length": Buffer.byteLength(stub),
+      "cache-control": "no-store",
+    });
+    return res.end(stub);
   }
 
   // 只有主站 claude.ai/claude.com 本身走 mock；其余子域（downloads/assets-proxy 等）
@@ -2854,6 +3398,25 @@ function handle(req, res, hostHeader) {
       if (/\/dxt\/(?:extensions|installable_extensions)$/.test(url.pathname)) {
         return json(res, { entries: [], total: 0 });
       }
+      // Statsig/实验求值与 frame 契约：这些请求从 api.anthropic.com 域发出，转发上游 403。
+      // claude.ai 域的同名请求在 mockApi 的 localCodeApi 里处理；这里覆盖 anthropic 域。
+      // POST 带 body 的请求必须先读完请求体再响应，否则客户端写剩余 body 时 ECONNRESET。
+      if (/^\/api\/eval\//.test(url.pathname) || url.pathname === "/api/frame/contract/latest" ||
+          url.pathname === "/api/directory/server-urls" ||
+          /^\/api\/frame\//.test(url.pathname) ||
+          (req.method === "GET" && url.pathname === "/api/artifacts/mcp")) {
+        return readBody(req, () => {
+          if (url.pathname === "/api/frame/contract/latest") return json(res, { contract: null, version: null });
+          if (url.pathname === "/api/directory/server-urls") {
+            return json(res, { claude_ai: "https://claude.ai", api: "https://api.anthropic.com" });
+          }
+          if (/^\/api\/frame\/track/.test(url.pathname)) return json(res, { ok: true });
+          if (/^\/api\/frame\/[^/]+$/.test(url.pathname)) {
+            return json(res, { error: "not_found", message: "Frame not found" }, 404);
+          }
+          json(res, {});
+        });
+      }
       // 远端托管策略：本地空放行（不挡插件/连接器）。
       // CLI 比 Desktop 校验更严格，settings 响应必须包含 uuid/checksum/settings。
       // policy_limits → {restrictions:{},compliance_taints:[],defaults:{}}（BymwSUZ2 校验器）
@@ -2884,6 +3447,24 @@ function handle(req, res, hostHeader) {
       // 真正的模型调用：转发到本地 Anthropic 兼容网关（流式原样透传）
       if (req.method === "POST" && url.pathname === "/v1/messages") {
         return readBody(req, (raw) => forwardGateway(req, res, url.pathname + url.search, raw));
+      }
+      // Code 面板打到 api.anthropic.com 的本地化接口：GitHub App 安装状态 / MCP 预热 /
+      // 仓库信任。这些请求转发上游会 20 秒超时并打崩 proxy，本地直接回空。
+      if (req.method === "GET" && url.pathname === "/v1/code/github/org-connection/installations-status") {
+        return json(res, { installations: [], org_connection: null, connected: false, viewer: null });
+      }
+      if (req.method === "POST" && url.pathname === "/v1/code/mcp-config/prewarm") return json(res, {});
+      if (req.method === "GET" && url.pathname === "/v1/code/repository-trust") {
+        return json(res, { repositories: [] });
+      }
+      if (/^\/v1\/code\/github\//.test(url.pathname)) return json(res, { installations: [] });
+      // Code 面板的 CLI bootstrap 会以 api.anthropic.com 为主机；本地直接回，
+      // 不能转发上游（真服务器对本地会话返回 403，Code 面板会一直等账号就绪）。
+      if (/^\/api\/claude_cli\/bootstrap/.test(url.pathname)) {
+        return json(res, { client_data: {}, settings: {}, config: {}, enabled: true, environments: [], sessions: [], plugins: [], items: [], data: [] });
+      }
+      if (/^\/api\/claude_cli\//.test(url.pathname)) {
+        return json(res, { settings: {}, config: {}, enabled: true, data: [], items: [], sessions: [], environments: [] });
       }
     }
     // 非主站域（downloads/assets-proxy 等）：统一走 proxyUpstream，
@@ -2931,7 +3512,7 @@ function handle(req, res, hostHeader) {
   }
 
   // 登录页外壳：直接回放录制到的 HTML（200，而不是上游的 302）。
-  // 仅 mock 模式；demo 模式的 / 走下面的演示页。
+  // 仅 mock 模式；demo 模式的 / 走上面的演示页。
   // / 和 /login 直接跳 /new：回登出态壳会让 app 跑登录/onboarding 流程（join/org-discovery）
   if (MODE === "mock" && ["/", "/login", "/app-unavailable-in-region"].includes(url.pathname)) {
     res.writeHead(302, { location: "/new", "content-length": 0 });
@@ -2944,10 +3525,13 @@ function handle(req, res, hostHeader) {
     !path.extname(url.pathname) &&
     !/^\/(?:api|edge-api|v1|claudeai-rpc)(?:\/|$)/.test(url.pathname)
   ) {
-    const shell = addExtensions(TEMPLATE_SHELL);
+    const baseShell = url.pathname.startsWith("/epitaxy") && TEMPLATE_SHELL_NO_PRELOAD_HTML
+      ? TEMPLATE_SHELL_NO_PRELOAD_HTML
+      : withDebugScript(TEMPLATE_SHELL_HTML);
+    const shell = artifactService.injectPanel(addExtensions(baseShell));
     res.writeHead(200, {
       "content-type": "text/html; charset=utf-8",
-      "content-length": shell.length,
+      "content-length": Buffer.byteLength(shell),
       "cache-control": "no-store",
       ...(url.pathname === "/new" ? { "set-cookie": activeOrgCookies() } : {}),
     });
@@ -2986,7 +3570,7 @@ function handle(req, res, hostHeader) {
     return;
   }
 
-  const isApi = url.pathname.startsWith("/api/");
+  const isApi = url.pathname.startsWith("/api/") || url.pathname.startsWith("/v1/");
   if (isApi) {
     if (MODE === "demo" || MODE === "mock") return mockApi(req, res, url);
   }
@@ -3268,6 +3852,12 @@ const outer = http.createServer((req, res) => {
     }
   }
   noteClient();
+  // Artifacts：CLI/Code 也会直连本机端口取 artifact 工具与 frame 数据。
+  if (req.method === "POST" && u.pathname === "/api/artifacts/mcp") return artifactService.handleMcp(req, res);
+  if ((req.method === "GET" || req.method === "HEAD") && u.pathname.startsWith("/__claude_local/artifacts")) {
+    if (artifactService.handleLocalApi(req.method, u, req, res)) return;
+  }
+  if (artifactService.handleFrameApi(req.method, u, req, res)) return;
   const fwd = (body) => forwardGateway(req, res, u.pathname + u.search, body);
   if (req.method === "GET" && u.pathname === "/v1/models") return json(res, modelList(runtime));
   if (req.method === "POST" && u.pathname === "/v1/messages") {

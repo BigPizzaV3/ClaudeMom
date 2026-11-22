@@ -1,18 +1,15 @@
 # 更新日志
 
-## 0.1.14 - 2026-11-22
+## 未发布
 
-- 项目可以用了：Chat 里能新建项目（不再提示「目前无法正常使用」），设置项目指令，往项目知识里加文本、Word / Excel / PowerPoint 文档、PDF 和图片；在项目里开的对话，回复时会带上项目指令和全部知识。项目、知识和项目里的对话都保存在本机，重启后还在；可以重命名、加星标、归档、删除项目，把对话移进移出项目。知识不做检索，每次对话把全部内容发给模型，知识多了会占上下文，费用也会更高（已加缓存标记，上游支持提示词缓存时能省一部分）。PDF 和图片按原文件发给模型，要上游支持 PDF / 图片输入。Google Drive、GitHub 这类同步来源和多人共享不支持。
-- 扩展市场：「扩展」页新增市场，可以搜索、安装和更新扩展。「官方审核」的扩展收在 claude-mom-extensions 仓库里，合并前看过代码；「社区」扩展来自作者自己的仓库，没人审核过，安装前会再确认一次。从市场新装的扩展直接启用，更新保留原来的开关；已安装的扩展有新版本时会提示。
-- 扩展清单里 `author`、`description` 写成 `null` 时不再被当成格式错误。
-
-## 0.1.13 - 2026-11-22
-
-- 页面扩展：ClaudeMom 新增「扩展」页，可以给 Claude 页面加上自己的脚本和样式。自带两个示例扩展（桌宠小橘、加宽对话区），默认关闭；也可以导入 .zip 或带 manifest.json 的文件夹。开关、导入、删除后刷新 Claude 页面即生效，不用重启。
-- ClaudeMom 界面改成左侧导航：上游 / Claude 设置 / 扩展；版本和检查更新挪到侧栏底部。
-- 上游用 OpenCode Go 时，Chat 和 Cowork 不再报「400 MissingSessionID」：发往 opencode.ai 的请求会带上会话标识（`x-opencode-session`），同一会话里保持不变，上游的缓存能命中。（#42）
-- 设置 → 记忆里保存记忆、切换记忆开关不再提示「无法保存记忆」。本地模式没有记忆合成，模型请求也不带记忆，这里的改动只在本次运行内保留。（#43）
-- 打开项目页不再因为会话列表格式不对而整页报错。（#40）
+- Projects 可以用了：左侧栏和 Code 面板（「项目 · 测试版」）会出现入口，能新建、改名、加星、归档和删除项目，数据保存在本机 `projects.json`。录制模板来自受限账号，本地模式现在把 `sink_planter_vase`（Projects）、`amber_tributary_heron/osprey/wren/ptarmigan`（Code 项目）以及 `cowork`、`omelette`、`operon` 等被 `blocked_by_org_tier` 挡掉的功能按最高档放开。
+- 项目详情页完整可用：预取三件套（详情 + `conversations_v2` + `accounts`）形状对齐新版前端契约；`conversations_v2` 返回项目内真实会话，`accounts` 回 owner 行，`permissions` 回完整权限枚举（含 `chat_project:chat:create`，决定能否在项目里开会话）。
+- 会话与项目绑定：会话行带 `chat_project_id`（REST 与 Code 会话行双发 `project_uuid`），`POST /chat_conversations` 接受 `project_uuid`/`chat_project_id` 建立归属；`GET /v1/code/sessions?chat_project_id=` 按项目过滤；`/projects/move_conversations` 支持把会话挪进/挪出项目。
+- 知识库子资源契约修正：`/syncs` 回顶层数组（前端 `Array.isArray` 校验），`POST /sync` 回 `kb_resync_status:"done"` 避免前端 5 秒轮询，详情响应带 `has_sync_sources:false`。
+- `/v1/*` 请求（claude.ai 域）现在和 `/api/*` 一样进本地 mock 层，不再落进通用 `{}` 兜底——此前 Code 会话列表等接口永远返回空对象。
+- 新建项目弹窗不再等 GitHub 仓库列表和 GitHub App 安装状态：这些请求在本地直接回空。之前它们转发上游后 20 秒超时，会以未处理的 socket error 把本地服务打崩，弹窗按钮也一直不可用。
+- Artifacts：聊天现在能真正产出作品。模型会拿到 `mcp__claude-artifacts__*` 工具（create_from_type / publish_version / list_artifacts …），调用结果写到官方 typed-artifacts 目录；claude.ai 页面右下角出现「Artifacts」面板，新作品自动弹出，可在 iframe 里预览、在浏览器里打开。`/api/frame/*`、`/api/frame/types`、frame 查看器外壳和 `*.claudeusercontent.com` 运行时都由本地服务提供，Code/Cowork 与聊天共用同一批作品。
+- 上游不支持 `tools` 时自动退回纯文本回复，不影响普通聊天。
 
 ## 0.1.12 - 2026-11-20
 

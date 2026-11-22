@@ -91,6 +91,14 @@ const ASSETS: &[(&str, &[u8])] = &[
         include_bytes!("../runtime/plugins.mjs"),
     ),
     (
+        "artifacts.mjs",
+        include_bytes!("../runtime/artifacts.mjs"),
+    ),
+    (
+        "artifact-panel.js",
+        include_bytes!("../runtime/artifact-panel.js"),
+    ),
+    (
         "connectors.mjs",
         include_bytes!("../runtime/connectors.mjs"),
     ),

@@ -239,10 +239,10 @@ async function response(req, body) {
   return result;
 }
 
-async function request(pathname, { host, body, type = "application/json", method = body === undefined ? "GET" : "POST", beforeBody } = {}) {
-  const raw = body === undefined ? undefined : Buffer.isBuffer(body) ? body : JSON.stringify(body);
+async function request(pathname, { host, body, method = body === undefined ? "GET" : "POST", beforeBody } = {}) {
+  const raw = body === undefined ? undefined : JSON.stringify(body);
   const headers = raw === undefined ? {} : {
-    "content-type": type,
+    "content-type": "application/json",
     "content-length": Buffer.byteLength(raw),
   };
   const send = async (req) => {
@@ -282,7 +282,7 @@ async function request(pathname, { host, body, type = "application/json", method
   }
 }
 
-async function requestText(host, pathname, headers = {}) {
+async function requestText(host, pathname, headers = {}, method = "GET") {
   const connect = http.request({
     hostname: "127.0.0.1", port: proxyPort, method: "CONNECT", path: `${host}:443`,
   });
@@ -299,7 +299,7 @@ async function requestText(host, pathname, headers = {}) {
   try {
     const result = await new Promise((resolve, reject) => {
       const req = https.request({
-        hostname: host, path: pathname, method: "GET", headers: { ...headers, connection: "close" }, agent,
+        hostname: host, path: pathname, method, headers: { ...headers, connection: "close" }, agent,
       });
       req.on("error", reject);
       req.on("response", (response) => {
@@ -626,7 +626,9 @@ after(async () => {
   if (dictationStateDir) {
     fs.unlinkSync(path.join(dictationStateDir, "dictation-helper.json"));
     fs.unlinkSync(path.join(dictationStateDir, "conversation-state.json"));
-    fs.rmSync(path.join(dictationStateDir, "project-files"), { recursive: true, force: true });
+    if (fs.existsSync(path.join(dictationStateDir, "projects.json"))) {
+      fs.unlinkSync(path.join(dictationStateDir, "projects.json"));
+    }
     fs.rmdirSync(dictationStateDir);
   }
   if (dictationCacheDir) {
@@ -752,101 +754,185 @@ test("Cowork plugin metadata is a dictionary rather than a paginated list", asyn
   assert.deepEqual(result.body, {});
 });
 
-test("memory settings and memory edits answer in the shapes the settings page validates", async () => {
-  const settings = "/api/organizations/local/memory/settings";
-  const off = await request(settings, { host: "claude.ai", body: { enabled_melange: false, enabled_saffron: false } });
-  assert.equal(off.status, 200);
-  assert.equal(off.body.memory_mode, "off");
-  assert.equal(off.body.enabled_saffron, false);
-  assert.equal((await request(settings, { host: "claude.ai" })).body.memory_mode, "off");
-  const classic = await request(settings, { host: "claude.ai", body: { enabled_melange: false, enabled_saffron: true } });
-  assert.equal(classic.body.memory_mode, "classic");
-
-  const memory = await request("/api/organizations/local/memory?project_uuid=p1", { host: "claude.ai" });
-  assert.equal(memory.status, 200);
-  assert.equal(typeof memory.body.memory, "string");
-  assert.ok("controls" in memory.body && "updated_at" in memory.body);
-
-  const saved = await request("/api/organizations/local/memory/controls", {
-    host: "claude.ai", method: "PUT", body: { controls: ["喜欢简短的回答"], base_controls_version: null },
+test("local Projects support create, list, count, read, update and delete", async () => {
+  const org = "local";
+  const created = await request(`/api/organizations/${org}/projects`, {
+    host: "claude.ai",
+    body: { name: "Local demo", description: "fixture project", is_private: true },
   });
-  assert.equal(saved.status, 200);
-  assert.deepEqual(saved.body.controls, ["喜欢简短的回答"]);
-  assert.equal(typeof saved.body.controls_version, "string");
-  assert.ok(!Number.isNaN(Date.parse(saved.body.updated_at)));
-  assert.deepEqual((await request("/api/organizations/local/memory", { host: "claude.ai" })).body.controls, ["喜欢简短的回答"]);
+  assert.equal(created.status, 201);
+  assert.equal(created.body.name, "Local demo");
+  assert.equal(created.body.description, "fixture project");
 
-  const reset = await request("/api/organizations/local/memory/reset", { host: "claude.ai", body: {} });
-  assert.equal(reset.body.controls, null);
+  const list = await request(`/api/organizations/${org}/projects?limit=30&order_by=latest_activity`, {
+    host: "claude.ai",
+  });
+  assert.equal(list.status, 200);
+  assert.ok(Array.isArray(list.body.data));
+  assert.equal(list.body.data.some((row) => row.uuid === created.body.uuid), true);
+
+  const v2 = await request(`/api/organizations/${org}/projects_v2?limit=30&offset=0`, { host: "claude.ai" });
+  assert.equal(v2.status, 200);
+  assert.equal(v2.body.data.some((row) => row.uuid === created.body.uuid), true);
+
+  const count = await request(`/api/organizations/${org}/projects/count`, { host: "claude.ai" });
+  assert.equal(count.status, 200);
+  assert.equal(count.body.count, 1);
+
+  const detail = await request(`/api/organizations/${org}/projects/${created.body.uuid}`, { host: "claude.ai" });
+  assert.equal(detail.status, 200);
+  assert.equal(detail.body.uuid, created.body.uuid);
+  assert.equal(detail.body.prompt_template, "");
+
+  const patched = await request(`/api/organizations/${org}/projects/${created.body.uuid}`, {
+    host: "claude.ai", method: "PATCH", body: { name: "Renamed", is_starred: true },
+  });
+  assert.equal(patched.status, 200);
+  assert.equal(patched.body.name, "Renamed");
+  assert.equal(patched.body.is_starred, true);
+
+  const conversations = await request(`/api/organizations/${org}/projects/${created.body.uuid}/conversations_v2?limit=30&offset=0`, {
+    host: "claude.ai",
+  });
+  assert.equal(conversations.status, 200);
+  assert.deepEqual(conversations.body.data, []);
+
+  const accounts = await request(`/api/organizations/${org}/projects/${created.body.uuid}/accounts`, { host: "claude.ai" });
+  assert.equal(accounts.status, 200);
+  assert.equal(accounts.body.data[0].role, "owner");
+
+  const permissions = await request(`/api/organizations/${org}/projects/${created.body.uuid}/permissions`, { host: "claude.ai" });
+  assert.equal(permissions.status, 200);
+  assert.equal(permissions.body.includes("chat_project:chat:create"), true);
+
+  // 知识库子资源：syncs 是顶层数组（前端 Array.isArray 校验），sync 触发返回 done 不触发轮询
+  const syncs = await request(`/api/organizations/${org}/projects/${created.body.uuid}/syncs?calculate_size=false`, { host: "claude.ai" });
+  assert.equal(syncs.status, 200);
+  assert.deepEqual(syncs.body, []);
+  const sync = await request(`/api/organizations/${org}/projects/${created.body.uuid}/sync`, {
+    host: "claude.ai", body: {},
+  });
+  assert.equal(sync.status, 200);
+  assert.equal(sync.body.kb_resync_status, "done");
+  const detail2 = await request(`/api/organizations/${org}/projects/${created.body.uuid}`, { host: "claude.ai" });
+  assert.equal(detail2.body.has_sync_sources, false);
+
+  const removed = await requestText("claude.ai", `/api/organizations/${org}/projects/${created.body.uuid}`, {}, "DELETE");
+  assert.equal(removed.status, 204);
+  const after = await request(`/api/organizations/${org}/projects/count`, { host: "claude.ai" });
+  assert.equal(after.body.count, 0);
 });
 
-test("project conversation lists are pages rather than empty objects", async () => {
-  const result = await request("/api/organizations/local/projects/p1/conversations_v2?limit=30&offset=0", { host: "claude.ai" });
+test("project sessions bind via chat_project_id and show in conversations_v2 and /v1/code/sessions", async () => {
+  const org = "local";
+  const created = await request(`/api/organizations/${org}/projects`, {
+    host: "claude.ai",
+    body: { name: "Session binder", description: "project session flow" },
+  });
+  assert.equal(created.status, 201);
+  const projectId = created.body.uuid;
+
+  // 项目内新建会话：POST /chat_conversations 带 project_uuid
+  const conv = await request(`/api/organizations/${org}/chat_conversations`, {
+    host: "claude.ai",
+    body: { project_uuid: projectId, name: "Bound session" },
+  });
+  assert.equal(conv.status, 201);
+  assert.equal(conv.body.chat_project_id, projectId);
+  assert.equal(conv.body.project_uuid, projectId);
+
+  // 详情页预取三件套之一：conversations_v2 返回该项目会话
+  const convs = await request(
+    `/api/organizations/${org}/projects/${projectId}/conversations_v2?limit=30&offset=0`,
+    { host: "claude.ai" },
+  );
+  assert.equal(convs.status, 200);
+  assert.ok(Array.isArray(convs.body.data));
+  assert.equal(convs.body.data.some((row) => row.uuid === conv.body.uuid && row.project_uuid === projectId), true);
+
+  // Code 会话列表按项目过滤：/v1/code/sessions?chat_project_id=
+  const sessions = await request(`/v1/code/sessions?chat_project_id=${projectId}&limit=30`, { host: "claude.ai" });
+  assert.equal(sessions.status, 200);
+  assert.ok(Array.isArray(sessions.body.sessions), JSON.stringify(sessions.body).slice(0, 200));
+  assert.equal(sessions.body.sessions.some((row) => row.uuid === conv.body.uuid && row.chat_project_id === projectId), true);
+
+  // 无项目的会话不会混进项目列表
+  const loose = await request(`/api/organizations/${org}/chat_conversations`, { host: "claude.ai", body: {} });
+  assert.equal(loose.status, 201);
+  assert.equal(loose.body.chat_project_id, null);
+  const still = await request(
+    `/api/organizations/${org}/projects/${projectId}/conversations_v2?limit=30&offset=0`,
+    { host: "claude.ai" },
+  );
+  assert.equal(still.body.data.some((row) => row.uuid === loose.body.uuid), false);
+
+  // 会话移动：挪出项目
+  const moved = await request(`/api/organizations/${org}/projects/move_conversations`, {
+    host: "claude.ai",
+    body: { conversation_uuids: [conv.body.uuid], project_uuid: null },
+  });
+  assert.equal(moved.status, 200);
+  const afterMove = await request(`/api/organizations/${org}/chat_conversations/${conv.body.uuid}`, { host: "claude.ai" });
+  assert.equal(afterMove.body.chat_project_id, null);
+  const sessionsAfter = await request(`/v1/code/sessions?chat_project_id=${projectId}`, { host: "claude.ai" });
+  assert.equal(sessionsAfter.body.sessions.some((row) => row.uuid === conv.body.uuid), false);
+
+  // 清理
+  await requestText("claude.ai", `/api/organizations/${org}/chat_conversations/${conv.body.uuid}`, {}, "DELETE");
+  await requestText("claude.ai", `/api/organizations/${org}/chat_conversations/${loose.body.uuid}`, {}, "DELETE");
+  await requestText("claude.ai", `/api/organizations/${org}/projects/${projectId}`, {}, "DELETE");
+});
+
+test("project creation dialog dependencies resolve locally instead of hanging upstream", async () => {
+  const repos = await request("/api/organizations/local/code/repos?skip_status=true&page=1&per_page=100&include_link_optional=true", {
+    host: "claude.ai",
+  });
+  assert.equal(repos.status, 200);
+  assert.deepEqual(repos.body.repos, []);
+
+  const installs = await request("/v1/code/github/org-connection/installations-status?include_viewer_install_probe=true", {
+    host: "api.anthropic.com",
+  });
+  assert.equal(installs.status, 200);
+  assert.deepEqual(installs.body.installations, []);
+
+  const prewarm = await request("/v1/code/mcp-config/prewarm", { host: "api.anthropic.com", body: {} });
+  assert.equal(prewarm.status, 200);
+
+  const rum = await request("/api/v2/rum?ddsource=browser", { host: "claude.ai", body: {} });
+  assert.equal(rum.status, 200);
+
+  // 分析像素 iframe 与实验求值：转发上游会 302/403，前端弹 "Couldn't load part of this page"。
+  const segmentHtml = await requestText("claude.ai", "/isolated-segment.html?v=a4ced7f85b", { accept: "text/html" });
+  assert.equal(segmentHtml.status, 200);
+  assert.match(segmentHtml.body, /<!doctype html>/i);
+  const evalResp = await request("/api/eval/sdk-fixture", { host: "claude.ai", body: {} });
+  assert.equal(evalResp.status, 200);
+  const contract = await request("/api/frame/contract/latest", { host: "claude.ai" });
+  assert.equal(contract.status, 200);
+});
+
+test("claude cli bootstrap resolves locally instead of falling through to a 403", async () => {
+  for (const host of ["claude.ai", "api.anthropic.com"]) {
+    const result = await request("/api/claude_cli/bootstrap?entrypoint=claude-desktop&model=local-model", { host });
+    assert.equal(result.status, 200, host);
+    assert.equal(result.body.enabled, true, host);
+    assert.deepEqual(result.body.sessions, [], host);
+  }
+});
+
+test("local bootstrap opens the Code projects rollout", async () => {
+  const result = await request("/api/bootstrap", { host: "claude.ai" });
   assert.equal(result.status, 200);
-  assert.deepEqual(result.body.data, []);
-  assert.equal(result.body.pagination.has_more, false);
-});
-
-/** 一个文件字段的 multipart/form-data 请求体。 */
-function formFile(filename, type, data) {
-  const boundary = `----fixture${crypto.randomUUID()}`;
-  return {
-    type: `multipart/form-data; boundary=${boundary}`,
-    body: Buffer.concat([
-      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: ${type}\r\n\r\n`),
-      Buffer.from(data),
-      Buffer.from(`\r\n--${boundary}--\r\n`),
-    ]),
+  const features = result.body.org_growthbook.features;
+  const javaHashId = (name) => {
+    let hash = 0;
+    for (const ch of name) hash = (Math.imul(31, hash) + ch.charCodeAt(0)) | 0;
+    return String(hash >>> 0);
   };
-}
-
-test("document conversion extracts text from Office files and plain text, and refuses what it cannot read", async () => {
-  const convert = (filename, type, data) => request("/api/organizations/local/convert_document", { host: "claude.ai", ...formFile(filename, type, data) });
-  const docx = storedZip({
-    "word/document.xml": '<w:document><w:body><w:p><w:r><w:t>第一段 &amp; more</w:t></w:r></w:p><w:p><w:r><w:t>Second</w:t></w:r><w:r><w:tab/><w:t>tab</w:t></w:r></w:p></w:body></w:document>',
-  });
-  const converted = await convert("报告.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", docx);
-  assert.equal(converted.status, 200);
-  assert.equal(converted.body.file_name, "报告.docx");
-  assert.equal(converted.body.extracted_content, "第一段 & more\nSecond\ttab");
-
-  const xlsx = storedZip({
-    "xl/sharedStrings.xml": "<sst><si><t>名称</t></si><si><t>数量</t></si></sst>",
-    "xl/worksheets/sheet1.xml": '<worksheet><sheetData><row><c t="s"><v>0</v></c><c t="s"><v>1</v></c></row><row><c t="inlineStr"><is><t>苹果</t></is></c><c><v>3</v></c></row></sheetData></worksheet>',
-  });
-  assert.equal((await convert("表.xlsx", "application/octet-stream", xlsx)).body.extracted_content, "## Sheet 1\n名称\t数量\n苹果\t3");
-
-  const pptx = storedZip({ "ppt/slides/slide1.xml": "<p:sld><a:p><a:r><a:t>标题</a:t></a:r></a:p></p:sld>" });
-  assert.equal((await convert("演示.pptx", "application/octet-stream", pptx)).body.extracted_content, "## Slide 1\n标题");
-
-  assert.equal((await convert("notes.md", "text/markdown", "# 标题\n正文")).body.extracted_content, "# 标题\n正文");
-  const pdf = await convert("scan.pdf", "application/pdf", "%PDF-1.7\n...");
-  assert.equal(pdf.status, 422);
-  assert.equal(pdf.body.error.details.error_code, "extraction_failed");
-});
-
-test("project uploads keep images and PDFs as files and refuse other files", async () => {
-  const org = "/api/organizations/local";
-  const project = (await request(`${org}/projects`, { host: "claude.ai", body: { name: "Uploads" } })).body;
-  const upload = (filename, type, data) => request(`${org}/projects/${project.uuid}/upload`, { host: "claude.ai", ...formFile(filename, type, data) });
-
-  const pdf = await upload("spec.pdf", "application/pdf", "%PDF-1.4\n1 0 obj << /Type /Page >> endobj\n2 0 obj << /Type /Page >> endobj\n3 0 obj << /Type /Pages >> endobj");
-  assert.equal(pdf.status, 200);
-  assert.equal(pdf.body.file_kind, "document");
-  assert.equal(pdf.body.document_asset.page_count, 2);
-  assert.equal(pdf.body.document_asset.url, `/api/local/files/${pdf.body.file_uuid}/document`);
-  // 客户端把 Office 文档送去转文本、纯文本自己读，别的文件传到这里一律不收。
-  const text = await upload("notes.txt", "text/plain", "plain knowledge");
-  assert.equal(text.status, 400);
-  assert.equal(text.body.error.details.error_code, "invalid_file_type");
-
-  const files = (await request(`${org}/projects/${project.uuid}/files`, { host: "claude.ai" })).body;
-  assert.deepEqual(files.map((file) => file.file_name), ["spec.pdf"]);
-  assert.deepEqual((await request(`${org}/projects/${project.uuid}/docs`, { host: "claude.ai" })).body, []);
-
-  const removed = await request(`${org}/projects/${project.uuid}/files/delete_many`, { host: "claude.ai", body: { file_uuids: [pdf.body.file_uuid] } });
-  assert.equal(removed.status, 200);
-  assert.deepEqual((await request(`${org}/projects/${project.uuid}/files`, { host: "claude.ai" })).body, []);
+  for (const name of ["amber_tributary_heron", "amber_tributary_osprey", "amber_tributary_wren"]) {
+    assert.equal(features[javaHashId(name)].defaultValue, true, name);
+  }
 });
 
 test("local mock accounts do not request identity verification", async () => {
@@ -937,10 +1023,31 @@ test("Artifacts receives a concrete artifact list and count", async () => {
 });
 
 test("Artifacts shared galleries receive frame arrays instead of load-error states", async () => {
-  for (const endpoint of ["/api/frame/frames", "/api/frame/frames/external"]) {
-    const result = await request(endpoint, { host: "claude.ai" });
-    assert.equal(result.status, 200);
-    assert.deepEqual(result.body.frames, []);
+  // /api/frame/frames：行带 slug（官方 ID 正则要求 UUID 形状）
+  const frames = await request("/api/frame/frames", { host: "claude.ai" });
+  assert.equal(frames.status, 200);
+  assert.ok(Array.isArray(frames.body.frames), "frames must be an array");
+  for (const row of frames.body.frames) {
+    assert.equal(typeof row.slug, "string");
+    assert.equal(typeof row.title, "string");
+  }
+  // /api/frame/frames/external：侧边栏 recents 行（bn() 读 id/title/icon/tint/type_slug/type_title/created_at）
+  const external = await request("/api/frame/frames/external", { host: "claude.ai" });
+  assert.equal(external.status, 200);
+  assert.ok(Array.isArray(external.body.frames), "external frames must be an array");
+  for (const row of external.body.frames) {
+    assert.equal(typeof row.id, "string");
+    assert.equal(typeof row.title, "string");
+    assert.equal(typeof row.type_slug, "string");
+  }
+  // 画廊主列表同样必须过官方 zw 校验形状
+  const gallery = await request("/api/frame/artifacts?rel=mine", { host: "claude.ai" });
+  assert.equal(gallery.status, 200);
+  assert.ok(Array.isArray(gallery.body.artifacts));
+  for (const row of gallery.body.artifacts) {
+    assert.equal(typeof row.id, "string");
+    assert.equal(typeof row.title, "string");
+    assert.equal(row.rel, "mine");
   }
 });
 
@@ -1417,7 +1524,13 @@ test("a connector that needs sign-in goes through OAuth in the browser and hands
 test("frame type catalog and plugin registry return validated list shapes", async () => {
   const types = await request("/api/frame/types", { host: "claude.ai" });
   assert.equal(types.status, 200);
-  assert.deepEqual(types.body.types, []);
+  // 本地 Artifacts 提供内置类型（design/slides/docs）；每行都要有 slug 与标题。
+  assert.ok(Array.isArray(types.body.types));
+  assert.ok(types.body.types.length >= 3);
+  for (const row of types.body.types) {
+    assert.equal(typeof row.slug, "string", JSON.stringify(row));
+    assert.equal(typeof row.title, "string");
+  }
   const registry = await request("/api/organizations/local/plugins/registry", { host: "claude.ai" });
   assert.equal(registry.status, 200);
   assert.deepEqual(registry.body.data, []);

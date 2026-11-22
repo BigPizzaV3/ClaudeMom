@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
 import { decode, get, asMsg, asStr, ld, vi } from "./rpc.mjs";
 import { createOfficialAssets, loadCoworkSystemPrompt } from "./official-assets.mjs";
-import { createGatewayStreamParser, createStateStore, dropUnroutedModels, gatewayBody, gatewayHttpError, isLocalNetworkHost, isPrivateFile, gatewayModel, gatewayTarget, mergePoolModels, modelLabel, modelSelectors, modelWindow, opencodeSessionHeaders, planProfile, requestSessionId, runtimeConfig } from "./runtime.mjs";
+import { createGatewayStreamParser, createStateStore, dropUnroutedModels, gatewayBody, gatewayHttpError, isLocalNetworkHost, isPrivateFile, gatewayModel, gatewayTarget, mergePoolModels, modelLabel, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const modelIds = ["alpha/claude-opus-4-6", "beta/gpt-6", "gamma/grok-4", "alpha/shared", "beta/shared"];
@@ -178,7 +178,7 @@ before(async () => {
     "audio/tone.mp3": Buffer.from([0x49, 0x44, 0x33]),
   });
   fs.mkdirSync(path.join(root, "runtime", "scripts"), { recursive: true });
-  for (const file of ["proxy.mjs", "conversation-service.mjs", "rpc.mjs", "runtime.mjs", "official-assets.mjs", "extensions.mjs", "plugins.mjs", "connectors.mjs", "projects.mjs", "scripts/patch-dictation-start.mjs"]) {
+  for (const file of ["proxy.mjs", "artifacts.mjs", "artifact-panel.js", "conversation-service.mjs", "rpc.mjs", "runtime.mjs", "official-assets.mjs", "extensions.mjs", "plugins.mjs", "connectors.mjs", "scripts/patch-dictation-start.mjs"]) {
     fs.copyFileSync(path.join(here, file), path.join(root, "runtime", file));
   }
   fs.copyFileSync(
@@ -629,11 +629,8 @@ test("installed template turns on Cowork and uses the classic home unless the ne
         "577907085": { defaultValue: true },
         // claude_ai_hub_web_delivery：录制账号在新主页实验组里，新主页藏掉了「Chat | Cowork」切换。
         "2436273311": { defaultValue: true },
-        // project_image：项目知识收不收图片。
-        "3346981045": { defaultValue: false },
       },
     },
-    gated_messages: { messages: { "secret:e9pmrg": "Use account memory" }, gates: [], locale: "en-US" },
     gated_imports_build_id: "fixture-build",
     gated_imports: {
       claude_ai_hub_web_delivery: { hash: "hub", css: [], preload: [] },
@@ -662,11 +659,6 @@ test("installed template turns on Cowork and uses the classic home unless the ne
   // 默认经典主页：合并式主页的开关和按 gated_imports 下发的代码都要去掉，「对话 | Cowork」切换才会出现。
   assert.deepEqual(on.org_growthbook.features["2436273311"], { defaultValue: false });
   assert.deepEqual(Object.keys(on.gated_imports), ["cardinal"]);
-  // 项目：知识里能传图片；删除、归档确认框有正文（没有时确认按钮是灰的），模板原有的文案不动。
-  assert.deepEqual(on.org_growthbook.features["3346981045"], { defaultValue: true });
-  assert.match(on.gated_messages.messages["secret:1lztl35"], /permanently deletes the project/);
-  assert.match(on.gated_messages.messages["secret:nwsiqa"], /<link>archived projects<\/link>/);
-  assert.equal(on.gated_messages.messages["secret:e9pmrg"], "Use account memory");
   const off = await features({ CLAUDE_LOCAL_COWORK: "0" });
   assert.deepEqual(off.system_prompts, { other_prompt: { on: false } });
   assert.deepEqual(off.org_growthbook.features["574905726"], { defaultValue: false });
@@ -1263,115 +1255,6 @@ test("RPC replies carry the upstream's HTTP error and RPC conversations open wit
   assert.equal(list.json.find((c) => c.uuid === conv).chat_messages, undefined, "会话列表不带消息");
 });
 
-test("projects keep their instructions and knowledge, hand them to the model in their chats, and survive a restart", async () => {
-  const host = "claude.ai";
-  const org = "/api/organizations/local";
-  const created = await request(service, `${org}/projects`, {
-    host, body: { name: "  小说  ", description: "写一本小说", is_private: true, is_starred: true },
-  });
-  assert.equal(created.status, 201);
-  const project = created.json;
-  assert.equal(project.name, "小说");
-  assert.equal(project.prompt_template, "");
-  assert.equal(project.archived_at, null);
-  assert.equal(typeof project.creator.uuid, "string");
-  assert.ok(project.permissions.includes("chat_project:chat:create"));
-  const base = `${org}/projects/${project.uuid}`;
-
-  // 两种列表都看得到；v1 是数组，v2 是分页。
-  assert.deepEqual((await request(service, `${org}/projects?include_harmony_projects=true&limit=30`, { host })).json.map((p) => p.uuid), [project.uuid]);
-  const page = (await request(service, `${org}/projects_v2?limit=30&offset=0&filter=is_creator&order_by=latest_activity&is_archived=false`, { host })).json;
-  assert.deepEqual(page.data.map((p) => p.uuid), [project.uuid]);
-  assert.equal(page.pagination.has_more, false);
-  assert.equal((await request(service, `${org}/projects/count`, { host })).json.count, 1);
-
-  const updated = await request(service, base, { host, method: "PUT", body: { prompt_template: "Always answer in haiku." } });
-  assert.equal(updated.json.prompt_template, "Always answer in haiku.");
-  const doc = await request(service, `${base}/docs`, { host, body: { file_name: "world.md", content: "The capital is Zed." } });
-  assert.equal(doc.status, 201);
-  assert.equal(doc.json.content, "The capital is Zed.");
-  assert.equal((await request(service, `${base}/docs?compact=true`, { host })).json[0].content, undefined);
-
-  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "base64");
-  const boundary = `----test${crypto.randomUUID()}`;
-  const uploaded = await request(service, `${base}/upload`, {
-    host, type: `multipart/form-data; boundary=${boundary}`,
-    body: Buffer.concat([
-      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="map.png"\r\nContent-Type: image/png\r\n\r\n`),
-      png, Buffer.from(`\r\n--${boundary}--\r\n`),
-    ]),
-  });
-  assert.equal(uploaded.json.file_kind, "image");
-  assert.equal(uploaded.json.preview_asset.image_width, 1);
-  const preview = await request(service, uploaded.json.preview_url, { host });
-  assert.deepEqual(preview.bytes, png);
-
-  // REST 建的会话带着项目，回复时项目的指令、文档和图片都发给模型。
-  const conv = (await request(service, `${org}/chat_conversations`, { host, body: { project_uuid: project.uuid } })).json;
-  assert.equal(conv.project_uuid, project.uuid);
-  await request(service, `${org}/chat_conversations/${conv.uuid}/completion`, { host, body: { prompt: "首都在哪？" } });
-  const sent = received.at(-1).body;
-  assert.match(sent.system[0].text, /Always answer in haiku\./);
-  assert.match(sent.system[0].text, /<source>world\.md<\/source>[\s\S]*The capital is Zed\./);
-  assert.deepEqual(sent.system[0].cache_control, { type: "ephemeral" });
-  assert.equal(sent.messages[0].content[0].type, "image");
-  assert.equal(sent.messages[0].content[0].source.data, png.toString("base64"));
-  assert.deepEqual(sent.messages[0].content.at(-1), { type: "text", text: "首都在哪？" });
-  assert.deepEqual((await request(service, `${base}/conversations_v2?limit=30&offset=0`, { host })).json.data.map((c) => c.uuid), [conv.uuid]);
-
-  // RPC：第一条消息带着项目 id（SendMessage 第 9 号字段）。
-  const rpcConv = crypto.randomUUID();
-  const rpc = (name, body) => request(service, `/claudeai-rpc/anthropic.bard.api.v1alpha.ConversationService/${name}`, {
-    host, body, type: "application/proto",
-  });
-  await rpc("SendAndSettle", Buffer.concat([
-    header(rpcConv),
-    ld(2, Buffer.concat([ld(1, `user-${crypto.randomUUID()}`), ld(2, `assistant-${crypto.randomUUID()}`), ld(3, "RPC 提问"), ld(9, project.uuid)])),
-  ]));
-  assert.match(received.at(-1).body.system[0].text, /Always answer in haiku\./);
-  const listed = decode((await rpc("ListConversations", ld(4, project.uuid))).bytes).map((field) => asMsg(field));
-  assert.deepEqual(listed.map((c) => asStr(get(c, 1))).sort(), [conv.uuid, rpcConv].sort());
-  assert.ok(listed.every((c) => asStr(get(c, 14)) === project.uuid));
-  // 不在项目里的对话不带 system。
-  await request(service, `${org}/chat_conversations/${crypto.randomUUID()}/completion`, { host, body: { prompt: "普通对话" } });
-  assert.equal(received.at(-1).body.system, undefined);
-  // 网页版不先建会话：第一条消息的 create_conversation_params 里带着项目。
-  const inline = crypto.randomUUID();
-  await request(service, `${org}/chat_conversations/${inline}/completion`, {
-    host, body: { prompt: "网页版的第一条", create_conversation_params: { project_uuid: project.uuid, name: "" } },
-  });
-  assert.match(received.at(-1).body.system[0].text, /Always answer in haiku\./);
-  assert.equal((await request(service, `${org}/chat_conversations/${inline}`, { host })).json.project.name, "小说");
-
-  await stop(service);
-  service = await start();
-  assert.equal((await request(service, base, { host })).json.prompt_template, "Always answer in haiku.");
-  assert.equal((await request(service, `${base}/docs`, { host })).json[0].content, "The capital is Zed.");
-  assert.equal((await request(service, `${base}/files`, { host })).json[0].file_uuid, uploaded.json.file_uuid);
-  await request(service, `${org}/chat_conversations/${conv.uuid}/completion`, { host, body: { prompt: "再问一次" } });
-  assert.match(received.at(-1).body.system[0].text, /The capital is Zed\./);
-
-  // 归档后默认列表里没有，按归档筛选才有。
-  await request(service, base, { host, method: "PUT", body: { is_archived: true, is_starred: false } });
-  assert.deepEqual((await request(service, `${org}/projects_v2?is_archived=false`, { host })).json.data, []);
-  assert.equal((await request(service, `${org}/projects_v2?is_archived=true`, { host })).json.data[0].uuid, project.uuid);
-
-  // 移出项目的对话不再带项目上下文。
-  const moved = await request(service, `${org}/chat_conversations/move_many`, { host, body: { conversation_uuids: [rpcConv], project_uuid: null } });
-  assert.deepEqual(moved.json.moved, [rpcConv]);
-  assert.equal((await request(service, `${org}/chat_conversations/${rpcConv}`, { host })).json.project_uuid, null);
-
-  // 删除项目：知识文件和项目里的对话一起删掉。
-  const files = path.join(root, "project-files");
-  assert.equal(fs.readdirSync(files).length, 2);
-  assert.equal((await request(service, base, { host, method: "DELETE" })).status, 204);
-  assert.equal((await request(service, base, { host })).status, 404);
-  assert.deepEqual(fs.readdirSync(files), []);
-  const remaining = (await request(service, `${org}/chat_conversations`, { host })).json.map((c) => c.uuid);
-  assert.equal(remaining.includes(conv.uuid), false);
-  assert.equal(remaining.includes(rpcConv), true);
-});
-
 test("installed template lists its example skills as disabled so Claude does not download them", async () => {
   // 技能内容只在 Anthropic 服务器上，本地装不上；标成已启用会让每次同步都失败（#16）。
   const runtimeDir = path.join(root, "skills-runtime");
@@ -1551,25 +1434,6 @@ test("gateway contracts keep duplicate model names distinct and old sessions use
   assert.equal(gatewayModel(config, undefined), modelIds[0]);
   assert.equal(gatewayModel(config, "claude-native-default"), modelIds[0]);
   assert.equal(gatewayModel(config, "claude-haiku-4-5"), modelIds[2]);
-});
-
-test("OpenCode Go upstreams get a stable x-opencode-session and other upstreams get nothing", () => {
-  const opencode = new URL("https://opencode.ai/zen/go/v1/messages");
-  assert.deepEqual(opencodeSessionHeaders(new URL("https://api.deepseek.com/anthropic/v1/messages"), () => "s1"), {});
-  assert.deepEqual(opencodeSessionHeaders(opencode, () => "conv-1"), { "x-opencode-session": "conv-1" });
-  const fallback = opencodeSessionHeaders(opencode)["x-opencode-session"];
-  assert.match(fallback, /^[0-9a-f-]{36}$/);
-  assert.equal(opencodeSessionHeaders(new URL("https://api.opencode.ai/v1"), () => "")["x-opencode-session"], fallback);
-  assert.equal(opencodeSessionHeaders(opencode, () => "bad\r\nvalue")["x-opencode-session"], fallback);
-
-  const id = "11111111-2222-4333-8444-555555555555";
-  const body = (metadata) => Buffer.from(JSON.stringify({ model: "m", metadata }));
-  assert.equal(requestSessionId({ "x-claude-code-session-id": id }, body({})), id);
-  assert.equal(requestSessionId({}, body({ session_id: id })), id);
-  assert.equal(requestSessionId({}, body({ user_id: `user_abc_account_x_session_${id}` })), id);
-  assert.equal(requestSessionId({}, body({ user_id: JSON.stringify({ device_id: "d", session_id: id }) })), id);
-  assert.equal(requestSessionId({}, body({ user_id: "local-test" })), "");
-  assert.equal(requestSessionId({}, Buffer.from("not json")), "");
 });
 
 test("gateway aliases preserve the configured ID and only resolve unique window or namespace matches", () => {

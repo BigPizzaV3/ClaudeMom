@@ -10,8 +10,8 @@
 import crypto from "node:crypto";
 import http from "node:http";
 import https from "node:https";
-import { createGatewayStreamParser, gatewayHttpError, gatewayModel, gatewayTarget, opencodeSessionHeaders, runtimeConfig } from "./runtime.mjs";
-import { withProjectContext } from "./projects.mjs";
+import { StringDecoder } from "node:string_decoder";
+import { createGatewayStreamParser, gatewayHttpError, gatewayModel, gatewayTarget, runtimeConfig } from "./runtime.mjs";
 import {
   decode, get, asStr, asMsg, asInt, ld, vi,
   requestMessages, frame, endFrame,
@@ -25,6 +25,14 @@ import {
 
 const runtime = runtimeConfig();
 
+/** 有 artifact 工具时给模型的一段说明（只在本机 store 里创作，不需要 claude.ai）。 */
+const ARTIFACT_SYSTEM = [
+  "Artifacts: when the user asks for a page, dashboard, poster, design, slides or any visual deliverable, build it with the artifact tools instead of pasting HTML into the reply.",
+  "Type slugs: Design = bcd2878f-a88d-4094-a616-8e39d8a5fd8a, Slides = 3e9dc3d6-8a10-4143-ac0b-5af4f2b03a61 (a bare name also works).",
+  "Call mcp__claude-artifacts__create_from_type with the type slug to get an artifact id, then mcp__claude-artifacts__publish_version with project/ files (project/index.html, project/canvas.json …).",
+  "Files must be self-contained HTML (inline CSS/JS). After publishing, keep the chat reply short and say the artifact opens in the Artifact panel.",
+].join(" ");
+
 function defaultGatewayRequest(target, options, callback) {
   return (target.protocol === "https:" ? https : http).request(options, callback);
 }
@@ -33,15 +41,15 @@ function defaultGatewayRequest(target, options, callback) {
  * 调网关拿一轮回复的文本增量。
  * 返回 {next} 迭代器：{done:false,value:string} / {done:true}，出错 throw。
  */
-function anthropicStream(messages, model, signal, request = defaultGatewayRequest, sessionId, context = null) {
+function anthropicStream(messages, model, signal, request = defaultGatewayRequest) {
   const queue = [];
   let notify = null;
   let done = false, failed = null;
   const push = (v) => { queue.push(v); const n = notify; notify = null; n?.(); };
   const fail = (e) => { failed ??= e; done = true; const n = notify; notify = null; n?.(); };
-  const payload = JSON.stringify(withProjectContext({
+  const payload = JSON.stringify({
     model: gatewayModel(runtime, model), max_tokens: 4096, stream: true, messages,
-  }, context));
+  });
   const u = gatewayTarget(runtime, "/v1/messages");
   const req = request(
     u,
@@ -55,7 +63,6 @@ function anthropicStream(messages, model, signal, request = defaultGatewayReques
         authorization: `Bearer ${runtime.key}`,
         "anthropic-version": "2023-06-01",
         accept: "text/event-stream",
-        ...opencodeSessionHeaders(u, () => sessionId),
       },
     },
     (res) => {
@@ -99,8 +106,8 @@ function anthropicStream(messages, model, signal, request = defaultGatewayReques
   };
 }
 
-async function* gatewayDeltas(messages, model, signal, request = defaultGatewayRequest, sessionId, context = null) {
-  const it = anthropicStream(messages, model, signal, request, sessionId, context);
+async function* gatewayDeltas(messages, model, signal, request = defaultGatewayRequest) {
+  const it = anthropicStream(messages, model, signal, request);
   for (;;) {
     const r = await it.next();
     if (r.done) return;
@@ -108,14 +115,147 @@ async function* gatewayDeltas(messages, model, signal, request = defaultGatewayR
   }
 }
 
+/**
+ * 带工具的一轮：和 anthropicStream 同一网关，但会收 tool_use 块。
+ * 返回 { text, toolCalls: [{id, name, input}], stopReason }；文本增量走 onText。
+ */
+function anthropicTurn(messages, model, tools, signal, onText, request = defaultGatewayRequest) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const settle = (fn, value) => { if (!settled) { settled = true; fn(value); } };
+    const payload = {
+      model: gatewayModel(runtime, model),
+      max_tokens: 8192,
+      stream: true,
+      messages,
+    };
+    if (tools?.length) {
+      payload.tools = tools;
+      payload.system = ARTIFACT_SYSTEM;
+    }
+    const u = gatewayTarget(runtime, "/v1/messages");
+    let text = "";
+    let stopReason = null;
+    let wrote = false;
+    const open = new Map(); // index -> {id, name, json}
+    let buf = "";
+    const decoder = new StringDecoder("utf8");
+
+    const finalize = () => {
+      const toolCalls = [];
+      for (const block of open.values()) {
+        let input = {};
+        try { input = block.json ? JSON.parse(block.json) : {}; } catch {}
+        toolCalls.push({ id: block.id, name: block.name, input });
+      }
+      settle(resolve, { text, toolCalls, stopReason });
+    };
+
+    const fail = (error) => settle(reject, error instanceof Error ? error : new Error(String(error)));
+
+    const dispatch = (chunk) => {
+      const data = chunk
+        .split("\n")
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(line.startsWith("data: ") ? 6 : 5))
+        .join("\n")
+        .trim();
+      if (!data || data === "[DONE]") return;
+      let event;
+      try { event = JSON.parse(data); } catch { return; }
+      wrote = true;
+      if (event.type === "content_block_start") {
+        const block = event.content_block || {};
+        if (block.type === "tool_use") {
+          const seeded = block.input && typeof block.input === "object" && Object.keys(block.input).length
+            ? JSON.stringify(block.input)
+            : "";
+          open.set(event.index, { id: block.id, name: block.name, json: seeded });
+        }
+      } else if (event.type === "content_block_delta") {
+        const delta = event.delta || {};
+        if (delta.type === "text_delta" && delta.text) {
+          text += delta.text;
+          onText?.(delta.text);
+        } else if (delta.type === "input_json_delta" && typeof delta.partial_json === "string") {
+          const block = open.get(event.index);
+          if (block) block.json += delta.partial_json;
+        }
+      } else if (event.type === "message_delta") {
+        if (event.delta?.stop_reason) stopReason = event.delta.stop_reason;
+      } else if (event.type === "message_stop") {
+        finalize();
+      } else if (event.type === "error" || (event.error && !event.type)) {
+        fail(gatewayErrorText(event) || data);
+      }
+    };
+
+    const feed = (chunk) => {
+      buf += chunk.replace(/\r\n?/g, "\n");
+      let index;
+      while ((index = buf.indexOf("\n\n")) >= 0) {
+        const block = buf.slice(0, index);
+        buf = buf.slice(index + 2);
+        dispatch(block);
+      }
+    };
+
+    const req = request(
+      u,
+      {
+        hostname: u.hostname, port: u.port || (u.protocol === "https:" ? 443 : 80),
+        path: u.pathname + u.search,
+        method: "POST", timeout: 300000,
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": runtime.key,
+          authorization: `Bearer ${runtime.key}`,
+          "anthropic-version": "2023-06-01",
+          accept: "text/event-stream",
+        },
+      },
+      (res) => {
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          const chunks = [];
+          let size = 0;
+          res.on("data", (c) => { if (size < 65536) { chunks.push(c); size += c.length; } });
+          res.on("end", () => fail(new Error(gatewayHttpError(res.statusCode, Buffer.concat(chunks)))));
+          res.on("error", fail);
+          return;
+        }
+        res.on("data", (chunk) => feed(typeof chunk === "string" ? chunk : decoder.write(chunk)));
+        res.on("end", () => {
+          feed(decoder.end());
+          if (buf.trim()) dispatch(buf);
+          // 网关忽略 stream:true，回了整段 JSON。
+          if (!wrote) {
+            let value = null;
+            try { value = JSON.parse(buf); } catch {}
+            const blocks = Array.isArray(value?.content) ? value.content : [];
+            for (const block of blocks) {
+              if (block?.type === "text") {
+                text += block.text || "";
+                if (block.text) onText?.(block.text);
+              }
+              if (block?.type === "tool_use") open.set(open.size, { id: block.id, name: block.name, json: JSON.stringify(block.input || {}) });
+            }
+          }
+          finalize();
+        });
+        res.on("error", fail);
+      },
+    );
+    req.on("timeout", () => req.destroy(new Error("上游超时：5 分钟没有响应")));
+    req.on("error", fail);
+    if (signal) signal.addEventListener("abort", () => { try { req.destroy(); } catch {} });
+    req.end(JSON.stringify(payload));
+  });
+}
+
 // ── 服务 ─────────────────────────────────────────────────────
 // deps: ensureConv(id) -> conv；listConvs() -> conv[]；log(...)
-// projectContext(conv) -> 项目要带给模型的上下文或 null；hasProject(uuid) -> 项目是否存在（见 projects.mjs）
-// conv 约定字段：uuid/name/created_at/updated_at/turns[]/nextIndex/leafMessageId/project_uuid
-export function createConversationService({
-  ensureConv, listConvs, log, onChange = () => {}, request = defaultGatewayRequest,
-  projectContext = () => null, hasProject = () => false,
-}) {
+// conv 约定字段：uuid/name/created_at/updated_at/turns[]/nextIndex/leafMessageId
+export function createConversationService({ ensureConv, listConvs, log, onChange = () => {}, request = defaultGatewayRequest, artifacts = null }) {
   /** convId -> {res, convId, frames, closed, hb} */
   const streams = new Map();
 
@@ -173,7 +313,6 @@ export function createConversationService({
           leaf,
           created: conv.created_at ? new Date(conv.created_at) : undefined,
           updated: conv.updated_at ? new Date(conv.updated_at) : undefined,
-          projectId: conv.project_uuid,
         })
       : undefined;
     const live = conv.turns.find((t) => !t.complete);
@@ -192,7 +331,6 @@ export function createConversationService({
       leaf: c.leafMessageId || undefined,
       created: c.created_at ? new Date(c.created_at) : undefined,
       updated: c.updated_at ? new Date(c.updated_at) : undefined,
-      projectId: c.project_uuid,
     });
   }
 
@@ -219,12 +357,55 @@ export function createConversationService({
           if (previous === turn) break;
           if (previous.text) messages.push({ role: "assistant", content: previous.text });
         }
-        for await (const delta of gatewayDeltas(messages, turn.model, controller.signal, request, conv.uuid, projectContext(conv))) {
-          if (turn.complete) break;
+        // artifact 工具循环：模型可以调用 create_from_type/publish_version，
+        // 执行结果写本地 store，再把 tool_result 交回模型让它说人话。
+        const follow = [];
+        let allowedTools = artifacts?.chatTools?.() || [];
+        const streamText = (delta) => {
+          if (turn.complete || !delta) return;
           turn.text += delta;
           onChange();
           const s = stream();
           if (s) writeEvent(s, streamEvent({ append: contentBlockAppend(turn.blockId, delta) }));
+        };
+        for (let step = 0; step < 4; step++) {
+          let result;
+          try {
+            result = await anthropicTurn([...messages, ...follow], turn.model, allowedTools, controller.signal, streamText, request);
+          } catch (error) {
+            // 上游不支持 tools（不少第三方网关会 400）：退回纯文本一轮。
+            if (step === 0 && allowedTools.length && /tool|schema|unsupported|invalid.?request|400/i.test(error.message)) {
+              log?.("gateway rejected artifact tools; retrying without tools");
+              allowedTools = [];
+              result = await anthropicTurn(messages, turn.model, [], controller.signal, streamText, request);
+            } else {
+              throw error;
+            }
+          }
+          if (!artifacts || !result.toolCalls.length) break;
+          const assistantBlocks = [];
+          if (result.text) assistantBlocks.push({ type: "text", text: result.text });
+          for (const call of result.toolCalls) {
+            assistantBlocks.push({ type: "tool_use", id: call.id, name: call.name, input: call.input });
+          }
+          follow.push({ role: "assistant", content: assistantBlocks });
+          const toolResults = [];
+          turn.toolCalls ||= [];
+          for (const call of result.toolCalls) {
+            const outcome = artifacts.runChatTool(call.name, call.input);
+            log?.(`artifact tool ${call.name} ok=${outcome.ok}`);
+            turn.toolCalls.push({
+              id: call.id, name: call.name, input: call.input,
+              result: outcome.text, artifact: outcome.artifact || null,
+            });
+            toolResults.push({
+              type: "tool_result", tool_use_id: call.id,
+              content: [{ type: "text", text: outcome.text }],
+              ...(outcome.ok ? {} : { is_error: true }),
+            });
+          }
+          follow.push({ role: "user", content: toolResults });
+          onChange();
         }
       } catch (e) {
         failed = controller.signal.aborted && turn.stopReason === "userCanceled" ? null : e;
@@ -243,7 +424,6 @@ export function createConversationService({
           status: 1, leaf: turn.asstId,
           created: conv.created_at ? new Date(conv.created_at) : undefined,
           updated: new Date(conv.updated_at),
-          projectId: conv.project_uuid,
         }),
         messages: [message({
           id: turn.asstId, convId: conv.uuid, role: "assistant", index: turn.asstIndex,
@@ -301,8 +481,6 @@ export function createConversationService({
     conv.turns.push(turn);
     conv.leafMessageId = turn.asstId;
     conv.model = turn.model;
-    // 在项目里开的对话：第一条消息带着项目 id。
-    if (!conv.project_uuid && hasProject(send.projectId)) conv.project_uuid = send.projectId;
     if (!conv.name || conv.name === "New conversation") conv.name = titleFromPrompt(send.text);
     conv.updated_at = now.toISOString();
     onChange(true);
@@ -322,7 +500,6 @@ export function createConversationService({
       parentMessageId: asStr(get(sm, 5)),
       inputMode: asInt(get(sm, 6)),
       model: asStr(get(asMsg(get(sm, 7)), 2)),
-      projectId: asStr(get(sm, 9)),
     };
   };
 
@@ -434,7 +611,6 @@ export function createConversationService({
             text: asStr(get(sm, 3)) ?? "",
             parentMessageId: asStr(get(sm, 5)),
             model: asStr(get(asMsg(get(sm, 7)), 2)),
-            projectId: asStr(get(sm, 9)),
           });
           await ensureReply(conv);
           const ack = mutationAck({ sessionId: header.sessionId, version: header.version, applied: true });
@@ -459,12 +635,8 @@ export function createConversationService({
         return unary(res, readHistoryResponse(conv ? buildStateUpdate(conv) : conversationUpdate({})));
       }
 
-      case "ListConversations": {
-        // ListConversationsRequest{older_cursor=1, limit=2, starred=3, project_id=4}
-        const projectId = asStr(get(reqMsg, 4));
-        const convs = projectId ? listConvs().filter((c) => c.project_uuid === projectId) : listConvs();
-        return unary(res, listConversationsResponse(convs.map(convProto)));
-      }
+      case "ListConversations":
+        return unary(res, listConversationsResponse(listConvs().map(convProto)));
 
       case "StreamConversationList": {
         res.writeHead(200, streamHeaders);
