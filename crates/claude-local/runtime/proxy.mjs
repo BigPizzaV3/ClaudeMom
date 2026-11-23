@@ -455,13 +455,24 @@ const log = (...a) => LOG && console.log(`[${now()}]`, ...a);
 // ── Artifacts（typed-artifact 本地实现）──────────────────────
 // 读写官方 Claude Desktop 的 typed-artifacts 目录：官方 Artifacts 页、Code/Cowork
 // 的 frame 查看器和聊天里的 artifact 卡片看到的是同一批作品。
-// frame 运行时来自本机录制，不放仓库；缺省读 <ClaudeMom 状态目录>/frame-runtime。
+// Claude 数据目录按官方桌面端的布局取（Windows %APPDATA%\Claude，
+// macOS ~/Library/Application Support/Claude），否则 macOS 上与官方作品库不共用。
+function claudeAppDataDir() {
+  if (process.platform === "darwin") {
+    return path.join(os.homedir(), "Library", "Application Support", "Claude");
+  }
+  return path.join(
+    process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"),
+    "Claude",
+  );
+}
 const ARTIFACT_ROOT = process.env.CLAUDE_LOCAL_ARTIFACT_ROOT || path.join(
-  process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"),
-  "Claude", "typed-artifacts",
+  claudeAppDataDir(), "typed-artifacts",
   String(ACCOUNT.uuid).slice(0, 8), String(ORG.uuid).slice(0, 8),
 );
-const FRAME_ROOT = process.env.CLAUDE_LOCAL_FRAME_ROOT || path.join(here, "..", "frame-runtime");
+// frame 运行时按 docs/artifacts.md 放在 ClaudeMom 状态目录下（backend.rs 的 install_assets
+// 也落这里），仓库/代理目录里没有只是开发布局的回退。
+const FRAME_ROOT = process.env.CLAUDE_LOCAL_FRAME_ROOT || path.join(APP_STATE_DIR, "frame-runtime");
 const artifactService = createArtifactService({
   artifactRoot: ARTIFACT_ROOT,
   frameRoot: FRAME_ROOT,
@@ -1573,7 +1584,7 @@ function mockApi(req, res, url) {
   // Artifacts：frame 列表/类型/文档/新建 和 claude-artifacts MCP。
   // 必须在通用 /api/frame/* 兜底之前，否则会先落到空 pageShape。
   if (artifactService.handleFrameApi(method, url, req, res)) return;
-  if (method === "POST" && p === "/api/artifacts/mcp") return artifactService.handleMcp(req, res);
+  if (method === "POST" && p === "/api/artifacts/mcp") return serveArtifactsMcp(req, res, url, url.hostname);
 
   // Claude Code CLI / Code 面板的 bootstrap 也会打到 claude.ai 这一侧。
   // 不本地接住会落到上游 claude.ai 并得到 403，Code 面板会一直等账号/配置就绪。
@@ -3181,6 +3192,22 @@ function pluginApi(req, res, url, p) {
 // ── 请求处理 ─────────────────────────────────────────────────
 const demoHtml = MODE === "demo" ? fs.readFileSync(path.join(here, "demo", "index.html")) : null;
 
+// ── Artifacts MCP 鉴权闸 ─────────────────────────────────────
+// POST /api/artifacts/mcp 能读/写/删整个作品库，必须挡住浏览器里跑的内容：
+//  - claudeusercontent.com 内容子域（作品 iframe 的源）一律 404——作品没有合法理由调它；
+//  - 带 origin 的请求（浏览器发起）只认主站源 claude.ai/claude.com；
+//  - 其余（桌面 CLI 直连、无 origin）放行——MITM 域本身已被代理接管，外层端口另有 Bearer 鉴权。
+function serveArtifactsMcp(req, res, url, hostName) {
+  if (/(^|\.)claudeusercontent\.com$/i.test(hostName)) {
+    return json(res, { error: "not_found" }, 404);
+  }
+  const origin = typeof req.headers.origin === "string" ? req.headers.origin : "";
+  if (origin && !/^https:\/\/(?:www\.)?claude\.(?:ai|com)\/?$/i.test(origin)) {
+    return json(res, { error: "origin_not_allowed" }, 403);
+  }
+  return artifactService.handleMcp(req, res);
+}
+
 function handle(req, res, hostHeader) {
   const host = hostHeader || "claude.ai";
   const url = new URL(req.url, `https://${host}`);
@@ -3190,17 +3217,21 @@ function handle(req, res, hostHeader) {
   const hostName = url.hostname.toLowerCase();
   const isMainClaudeHost = /^(claude\.ai|www\.claude\.ai|claude\.com|www\.claude\.com)$/.test(hostName);
 
-  // Artifacts：MCP 端点不分域名（CLI 可能走 claude.ai 或 api.anthropic.com）。
+  // Artifacts：MCP 端点在主站与 api.anthropic.com 上可用（CLI 两侧都会打），经鉴权闸。
   if (req.method === "POST" && url.pathname === "/api/artifacts/mcp") {
-    return artifactService.handleMcp(req, res);
+    return serveArtifactsMcp(req, res, url, hostName);
   }
   // 作品内容子域：<uuid>.claudeusercontent.com 的 _f/<ver>/* 与 _runtime/*。
   if (/(^|\.)claudeusercontent\.com$/i.test(hostName)) {
     return artifactService.handleFrameHost(req, res, url, hostName);
   }
-  // 本地 Artifact 面板的同源接口（面板脚本、列表、预览）。
+  // 本地 Artifact 面板的同源接口：只回 JSON 元数据（列表/meta）。raw 预览已挪到
+  // 内容子域（handleFrameHost），主站源下不再提供模型生成的 HTML。
   if (isMainClaudeHost && url.pathname.startsWith("/__claude_local/artifacts")) {
     if (artifactService.handleLocalApi(req.method, url, req, res)) return;
+    if (/^\/__claude_local\/artifacts\/[^/]+\/raw$/.test(url.pathname)) {
+      return json(res, { error: "not_found" }, 404);
+    }
   }
   // 查看器外壳：iframe / product=viewer 的 /code/artifact/<uuid>，以及短链 /artifact/<short>。
   if (
@@ -3922,8 +3953,8 @@ const outer = http.createServer((req, res) => {
     }
   }
   noteClient();
-  // Artifacts：CLI/Code 也会直连本机端口取 artifact 工具与 frame 数据。
-  if (req.method === "POST" && u.pathname === "/api/artifacts/mcp") return artifactService.handleMcp(req, res);
+  // Artifacts：CLI/Code 也会直连本机端口取 artifact 工具与 frame 数据（外层已过 Bearer 鉴权）。
+  if (req.method === "POST" && u.pathname === "/api/artifacts/mcp") return serveArtifactsMcp(req, res, u, (u.hostname || "127.0.0.1").toLowerCase());
   if ((req.method === "GET" || req.method === "HEAD") && u.pathname.startsWith("/__claude_local/artifacts")) {
     if (artifactService.handleLocalApi(req.method, u, req, res)) return;
   }

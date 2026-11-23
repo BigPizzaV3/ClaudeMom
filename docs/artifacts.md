@@ -62,9 +62,11 @@ frame-runtime/
 
 ## 本地调试接口
 
-`/__claude_local/artifacts` 仍保留在本地服务里（作品列表、
-`/<id>/raw` 预览、`/<id>/meta`），仅供调试；不再往页面注入浮动面板。
-作品的日常使用走官方 frame 查看器（`/code/artifact/<uuid>`）。
+`/__claude_local/artifacts` 仍保留在本地服务里（作品列表、`/<id>/meta`），
+仅供调试；不再往页面注入浮动面板。`/<id>/raw` 预览放在内容子域
+（`<uuid>.claudeusercontent.com/__claude_local/artifacts/<id>/raw`）并带 sandbox CSP：
+模型生成的 HTML 不能落在 claude.ai 源下。作品的日常使用走官方 frame 查看器
+（`/code/artifact/<uuid>`）。
 
 ## 测试
 

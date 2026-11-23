@@ -222,7 +222,8 @@ export function gatewayModel(config, requested) {
 
 const GATEWAY_RAW_LIMIT = 1 << 20;
 
-function gatewayErrorText(value) {
+/** 提取网关错误响应/事件里的可读文本（error 或 message 字段）。 */
+export function gatewayErrorText(value) {
   if (!isRecord(value)) return "";
   const error = value.error;
   if (typeof error === "string") return error;

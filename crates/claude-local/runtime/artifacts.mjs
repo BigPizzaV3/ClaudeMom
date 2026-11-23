@@ -65,13 +65,15 @@ export function frameShortId(uuid) {
   return String(uuid).replace(/-/g, "").slice(0, 22);
 }
 
-/** 由短 id 找回完整 uuid（前缀匹配，忽略连字符）。 */
+/** 由 uuid / 短 id（忽略连字符、前缀匹配）找回 store 里真实存在的目录名。
+ *  只返回 names() 里的值或 null，绝不回传调用方输入：slug 来自模型，若原样透传，
+ *  dirOf 会拼出 artifactRoot 之外的路径（../ 穿越等于任意目录读写删）。 */
 function resolveId(names, value) {
   const raw = String(value || "");
   if (names.includes(raw)) return raw;
-  const needle = raw.replace(/-/g, "").toLowerCase();
-  if (needle.length < 8) return raw;
-  return names.find((name) => name.replace(/-/g, "").toLowerCase().startsWith(needle)) || raw;
+  const needle = raw.replace(/[^0-9a-f]/gi, "").toLowerCase();
+  if (needle.length < 8) return null;
+  return names.find((name) => name.replace(/-/g, "").toLowerCase().startsWith(needle)) || null;
 }
 
 function readJson(file, fallback = null) {
@@ -333,7 +335,9 @@ export function createArtifactService({ artifactRoot, frameRoot, origin = "https
     const entries = [];
     for (const file of files) {
       const filePath = String(file.path || file.name || "").replace(/^\/+/, "");
-      if (!filePath || filePath.split("/").some((part) => part === "..")) continue;
+      // 只留安全相对路径：拒绝 ..、盘符/绝对路径和反斜杠分隔（Windows 上 join 会把它当分隔符）。
+      if (!filePath || filePath.split(/[/\\]/).some((part) => part === ".." || part === "")) continue;
+      if (/^[a-zA-Z]:/.test(filePath) || path.isAbsolute(filePath)) continue;
       const raw = String(file.content ?? file.text ?? "");
       const buffer = file.encoding === "base64" ? Buffer.from(raw, "base64") : Buffer.from(raw, "utf8");
       const hash = sha256(buffer);
@@ -606,10 +610,11 @@ export function createArtifactService({ artifactRoot, frameRoot, origin = "https
       return true;
     }
     // ── 管理面：retitle / duplicate / favorite ──
+    const notFound = () => json(res, { error: { type: "not_found_error" } }, 404);
     const retitle = p.match(/^\/api\/frame\/retitle\/([0-9A-Za-z_-]{8,64})$/);
     if (method === "POST" && retitle) {
       const id = resolveId(names(), retitle[1]);
-      if (!fs.existsSync(dirOf(id))) return json(res, { error: { type: "not_found_error" } }, 404), true;
+      if (!id) return notFound(), true;
       readBody(req).then((raw) => {
         let title = null;
         try { title = JSON.parse(raw)?.title; } catch {}
@@ -621,7 +626,7 @@ export function createArtifactService({ artifactRoot, frameRoot, origin = "https
     const favorite = p.match(/^\/api\/frame\/favorite\/([0-9A-Za-z_-]{8,64})$/);
     if (favorite && (method === "POST" || method === "DELETE")) {
       const id = resolveId(names(), favorite[1]);
-      if (!fs.existsSync(dirOf(id))) return json(res, { error: { type: "not_found_error" } }, 404), true;
+      if (!id) return notFound(), true;
       setStarred(id, method === "POST");
       // 官方 ru() 检查 status===204
       res.writeHead(204, { "cache-control": "no-store" });
@@ -631,8 +636,8 @@ export function createArtifactService({ artifactRoot, frameRoot, origin = "https
     const duplicate = p.match(/^\/api\/frame\/duplicate\/([0-9A-Za-z_-]{8,64})$/);
     if (method === "POST" && duplicate) {
       const id = resolveId(names(), duplicate[1]);
-      const created = duplicateArtifact(id);
-      if (!created) return json(res, { error: { type: "not_found_error" } }, 404), true;
+      const created = id ? duplicateArtifact(id) : null;
+      if (!created) return notFound(), true;
       json(res, frameDocument(created.id));
       return true;
     }
@@ -640,14 +645,14 @@ export function createArtifactService({ artifactRoot, frameRoot, origin = "https
     const frameId = p.match(/^\/api\/frame\/([0-9A-Za-z_-]{8,64})$/);
     if (frameId) {
       const id = resolveId(names(), frameId[1]);
-      const exists = fs.existsSync(dirOf(id));
+      const exists = Boolean(id) && fs.existsSync(dirOf(id));
       if (method === "DELETE") {
-        if (!exists) return json(res, { error: { type: "not_found_error" } }, 404), true;
+        if (!exists) return notFound(), true;
         json(res, { ok: deleteArtifact(id) });
         return true;
       }
       if (method === "GET") {
-        if (!exists) return json(res, { error: { type: "not_found_error" } }, 404), true;
+        if (!exists) return notFound(), true;
         json(res, frameDocument(id));
         return true;
       }
@@ -752,7 +757,7 @@ export function createArtifactService({ artifactRoot, frameRoot, origin = "https
     const self = p.match(/^\/api\/frame\/self\/([0-9A-Za-z_-]{8,64})$/);
     if (self && method === "POST") {
       const id = resolveId(names(), self[1]);
-      if (!fs.existsSync(dirOf(id))) return json(res, { error: { type: "not_found_error" } }, 404), true;
+      if (!id) return notFound(), true;
       readBody(req).then((raw) => {
         try {
           const parsed = JSON.parse(raw.toString("utf8"));
@@ -780,10 +785,28 @@ export function createArtifactService({ artifactRoot, frameRoot, origin = "https
   }
 
   // ── <uuid>.claudeusercontent.com / frame 运行时 ─────────────
-  /** artifact 内容子域 + 运行时资源。hostName 形如 <uuid>.claudeusercontent.com 或 frame.claudeusercontent.com。 */
+  /** artifact 内容子域 + 运行时资源。hostName 形如 <uuid>.claudeusercontent.com 或 frame.claudeusercontent.com。
+   *  本地调试的 raw 预览也挂在这里：模型生成的 HTML 与主站隔离（sandbox CSP + 独立源），
+   *  不再放 claude.ai 源下。 */
   function handleFrameHost(req, res, url, hostName) {
     const p = url.pathname;
     if (p === "/_warmup") return json(res, {}), true;
+    // 调试预览：/__claude_local/artifacts/<id>/raw。只在内容子域源下提供，
+    // sandbox CSP 禁掉同源请求/脚本/表单，读得到内容也用不了它调本地 API。
+    const preview = p.match(/^\/__claude_local\/artifacts\/([0-9A-Za-z_-]{8,64})\/raw$/);
+    if (preview && (req.method === "GET" || req.method === "HEAD")) {
+      const id = resolveId(names(), preview[1]);
+      if (!id) return json(res, { error: "not_found" }, 404), true;
+      const html = previewHtml(id);
+      if (!html) return send(res, 404, "text/html; charset=utf-8", "<!doctype html><meta charset=utf-8><p>No preview for this artifact.</p>"), true;
+      send(res, 200, "text/html; charset=utf-8", html, {
+        "x-content-type-options": "nosniff",
+        "cache-control": "no-store",
+        // sandbox：无 allow-same-origin，文档拿不到本源存储/接口；无 allow-scripts 之外的特权。
+        "content-security-policy": "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:",
+      });
+      return true;
+    }
     if (p === "/_t") {
       if (url.searchParams.get("__frame_renew") === "1") {
         res.writeHead(204, { "cache-control": "no-store" });
@@ -796,6 +819,8 @@ export function createArtifactService({ artifactRoot, frameRoot, origin = "https
       return true;
     }
     const id = resolveId(names(), String(hostName).split(".")[0]);
+    // 子域标签解析不出本机作品时按空 store 处理：所有读取返回 not_found，
+    // 绝不把外部输入继续传给 dirOf/readFileOf。
 
     if (p.startsWith("/_runtime/") || p.startsWith("/_cas/")) {
       if (sendFile(res, path.join(frameRoot, "shared", p.slice(1)))) return true;
@@ -806,6 +831,7 @@ export function createArtifactService({ artifactRoot, frameRoot, origin = "https
     if (match) {
       const ver = match[1];
       const rest = match[2] || "index.html";
+      if (!id) return json(res, { error: "not_found" }, 404), true;
       if (p === `/_f/${ver}/_files.json` || rest === "_files.json") {
         const meta = metaOf(id);
         const typeName = meta.type === "slides" ? "slides" : meta.type === "docs" ? "docs" : "design";
@@ -847,7 +873,7 @@ export function createArtifactService({ artifactRoot, frameRoot, origin = "https
     const match = /^\/(?:code\/(?:artifact|frame)|artifact)\/([0-9A-Za-z_-]{8,36})$/.exec(url.pathname);
     if (!match) return false;
     const id = resolveId(names(), match[1]);
-    if (!fs.existsSync(dirOf(id))) {
+    if (!id) {
       send(res, 404, "text/html; charset=utf-8", "<!doctype html><meta charset=utf-8><p>Artifact not found</p>");
       return true;
     }
@@ -909,7 +935,10 @@ a{display:inline-block;padding:9px 16px;border-radius:10px;background:#b4472e;co
     return String(text).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
   }
 
-  /** 返回 true 表示已处理。`/__claude_local/artifacts*` 只在主站同源下使用。 */
+  /** 返回 true 表示已处理。`/__claude_local/artifacts*` 的鉴权在 proxy 侧：
+   *  列表/meta 只回 JSON 元数据，走主站同源；raw 回的是模型生成的 HTML，
+   *  必须放在内容子域（handleFrameHost）并带 sandbox CSP，不能放 claude.ai 源下，
+   *  否则作品内容能同源摸到主站全部本地接口。 */
   function handleLocalApi(method, url, req, res) {
     const p = url.pathname.replace(/\/+$/, "") || "/";
     if (method !== "GET" && method !== "HEAD") return false;
@@ -917,17 +946,11 @@ a{display:inline-block;padding:9px 16px;border-radius:10px;background:#b4472e;co
       json(res, { artifacts: listArtifacts() });
       return true;
     }
-    const match = /^\/__claude_local\/artifacts\/([0-9A-Za-z_-]{8,64})\/(raw|meta)$/.exec(p);
+    const match = /^\/__claude_local\/artifacts\/([0-9A-Za-z_-]{8,64})\/(meta)$/.exec(p);
     if (match) {
       const id = resolveId(names(), match[1]);
-      if (!fs.existsSync(dirOf(id))) return json(res, { error: "not_found" }, 404), true;
-      if (match[2] === "meta") return json(res, rowOf(id) || { id }), true;
-      const html = previewHtml(id);
-      if (!html) return send(res, 404, "text/html; charset=utf-8", "<!doctype html><meta charset=utf-8><p>No preview for this artifact.</p>"), true;
-      send(res, 200, "text/html; charset=utf-8", html, {
-        "x-content-type-options": "nosniff",
-        "cache-control": "no-store",
-      });
+      if (!id) return json(res, { error: "not_found" }, 404), true;
+      json(res, rowOf(id) || { id });
       return true;
     }
     return false;
@@ -1022,6 +1045,13 @@ a{display:inline-block;padding:9px 16px;border-radius:10px;background:#b4472e;co
   }
 
   function callTool(name, args = {}) {
+    // slug 只认本机 store 里已存在的作品；解析不出按 not found 处理（is_error 回给模型），
+    // 绝不把模型给的字符串直接交给文件系统。
+    const requireId = (key = "slug") => {
+      const id = resolveId(names(), args[key] || args.id || args.artifact_slug);
+      if (!id) throw new Error(`artifact not found: ${args[key] || args.id || args.artifact_slug || ""}`);
+      return id;
+    };
     switch (name) {
       case "create_from_type":
       case "create_artifact": {
@@ -1032,7 +1062,7 @@ a{display:inline-block;padding:9px 16px;border-radius:10px;background:#b4472e;co
       case "publish_version":
       case "edit_version":
       case "publish_files": {
-        const id = resolveId(names(), args.slug || args.artifact_slug || args.id);
+        const id = requireId();
         const result = publishVersion(id, Array.isArray(args.files) ? args.files : [], { title: args.title, remove: args.remove });
         return toolResult(result);
       }
@@ -1041,22 +1071,22 @@ a{display:inline-block;padding:9px 16px;border-radius:10px;background:#b4472e;co
       case "list_types":
         return toolResult(Object.entries(TYPES).map(([name, type]) => ({ name, ...type })));
       case "get_artifact": {
-        const id = resolveId(names(), args.slug || args.id);
+        const id = requireId();
         const { doc } = versionsOf(id);
         return toolResult({ slug: id, ...doc });
       }
       case "list_files": {
-        const id = resolveId(names(), args.slug || args.id);
+        const id = requireId();
         const { latest } = latestOf(id);
         return toolResult((latest?.files || []).map((entry) => ({ path: entry[0], content_type: entry[2] })));
       }
       case "read_file": {
-        const id = resolveId(names(), args.slug || args.id);
+        const id = requireId();
         const buffer = readFileOf(id, String(args.path || ""));
         return buffer ? toolResult(buffer.toString("utf8")) : toolResult("file not found", true);
       }
       case "delete_artifact": {
-        const id = resolveId(names(), args.slug || args.id);
+        const id = requireId();
         return toolResult({ ok: deleteArtifact(id) });
       }
       case "guide":
@@ -1126,7 +1156,13 @@ a{display:inline-block;padding:9px 16px;border-radius:10px;background:#b4472e;co
   function runChatTool(name, input) {
     const bare = String(name || "").replace(/^mcp__claude-artifacts__/, "");
     if (bare === name) return { ok: false, text: `unknown tool: ${name}` };
-    const result = callTool(bare, input || {});
+    let result;
+    try {
+      result = callTool(bare, input || {});
+    } catch (error) {
+      // slug 不存在等执行错误作为 is_error 结果交回模型，不能让整轮对话失败。
+      result = toolResult(String(error?.message || error), true);
+    }
     const text = result.content?.[0]?.text || "";
     let artifact = null;
     try {

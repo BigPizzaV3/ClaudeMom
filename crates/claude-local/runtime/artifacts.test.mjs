@@ -77,6 +77,23 @@ test("chat tools carry the official MCP names and execute", () => {
   assert.match(listed.text, /Deck/);
 });
 
+test("unresolvable slugs fail as tool errors instead of touching the filesystem", () => {
+  const { artifactRoot, frameRoot } = fixture();
+  const service = createArtifactService({ artifactRoot, frameRoot });
+  // 模型给的 slug（含 ../ 穿越与完全没见过的值）一律 not found，绝不下到文件系统。
+  for (const slug of ["../escape", "../../etc", "00000000-0000-0000-0000-000000000000"]) {
+    const deleted = service.runChatTool("mcp__claude-artifacts__delete_artifact", { slug });
+    assert.equal(deleted.ok, false, `delete with ${slug} must be an error`);
+    assert.match(deleted.text, /not found/);
+    const published = service.runChatTool("mcp__claude-artifacts__publish_version", {
+      slug, files: [{ path: "project/index.html", content: "pwned" }],
+    });
+    assert.equal(published.ok, false, `publish with ${slug} must be an error`);
+  }
+  // store 里没建过任何作品目录：artifactRoot 本身都不该被创建，更不会有穿越产生的文件。
+  assert.equal(fs.existsSync(artifactRoot), false);
+});
+
 test("frame content host serves the manifest and project files", () => {
   const { artifactRoot, frameRoot } = fixture();
   const service = createArtifactService({ artifactRoot, frameRoot });
@@ -113,20 +130,33 @@ test("frame API lists typed artifacts and creates from a type", async () => {  c
   assert.equal(service.artifacts.listArtifacts().length, 2);
 });
 
-test("local API: preview HTML and listing", async () => {
+test("local API: meta and listing stay on the main host, raw preview moves to the content host", async () => {
   const { artifactRoot, frameRoot } = fixture();
   const service = createArtifactService({ artifactRoot, frameRoot });
   const { id } = service.artifacts.createArtifact("design", "Preview");
   service.artifacts.publishVersion(id, [{ path: "project/index.html", content: "<!doctype html><h1>preview</h1>" }]);
 
-  const rawRes = fakeRes();
-  assert.equal(service.handleLocalApi("GET", new URL(`https://claude.ai/__claude_local/artifacts/${id}/raw`), {}, rawRes), true);
-  assert.equal(rawRes.status, 200);
-  assert.match(rawRes.body.toString("utf8"), /preview/);
-
+  // 列表/meta 仍在主站源下（JSON 元数据，无内容）。
   const listRes = fakeRes();
   service.handleLocalApi("GET", new URL("https://claude.ai/__claude_local/artifacts"), {}, listRes);
   assert.equal(JSON.parse(listRes.body.toString("utf8")).artifacts.length, 1);
+  const metaRes = fakeRes();
+  assert.equal(service.handleLocalApi("GET", new URL(`https://claude.ai/__claude_local/artifacts/${id}/meta`), {}, metaRes), true);
+  assert.equal(metaRes.status, 200);
+
+  // 主站源下的 raw 不再提供（模型生成的 HTML 不能落 claude.ai 源）。
+  const blockedRes = fakeRes();
+  assert.equal(service.handleLocalApi("GET", new URL(`https://claude.ai/__claude_local/artifacts/${id}/raw`), {}, blockedRes), false);
+
+  // raw 挪到内容子域，带 sandbox CSP。
+  const rawRes = fakeRes();
+  assert.equal(
+    service.handleFrameHost({ method: "GET", headers: {} }, rawRes, new URL(`https://${id}.claudeusercontent.com/__claude_local/artifacts/${id}/raw`), `${id}.claudeusercontent.com`),
+    true,
+  );
+  assert.equal(rawRes.status, 200);
+  assert.match(rawRes.body.toString("utf8"), /preview/);
+  assert.match(String(rawRes.headers["content-security-policy"]), /sandbox/);
 });
 
 test("type slugs accept bare names", () => {

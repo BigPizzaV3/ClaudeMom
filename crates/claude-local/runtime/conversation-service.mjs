@@ -11,7 +11,8 @@ import crypto from "node:crypto";
 import http from "node:http";
 import https from "node:https";
 import { StringDecoder } from "node:string_decoder";
-import { createGatewayStreamParser, gatewayHttpError, gatewayModel, gatewayTarget, runtimeConfig } from "./runtime.mjs";
+import { createGatewayStreamParser, gatewayErrorText, gatewayHttpError, gatewayModel, gatewayTarget, opencodeSessionHeaders, runtimeConfig } from "./runtime.mjs";
+import { withProjectContext } from "./projects.mjs";
 import {
   decode, get, asStr, asMsg, asInt, ld, vi,
   requestMessages, frame, endFrame,
@@ -227,10 +228,14 @@ function anthropicTurn(messages, model, tools, signal, onText, request = default
         res.on("end", () => {
           feed(decoder.end());
           if (buf.trim()) dispatch(buf);
-          // 网关忽略 stream:true，回了整段 JSON。
+          // 网关忽略 stream:true，回了整段 JSON（对齐 createGatewayStreamParser 的兜底）：
+          // 错误 JSON 要报错，正常回复要提取文本/工具调用，空的要报错而不是静默成功。
           if (!wrote) {
             let value = null;
             try { value = JSON.parse(buf); } catch {}
+            if (value && (value.type === "error" || (value.error && !Array.isArray(value.content)))) {
+              return fail(new Error(`上游返回错误：${gatewayErrorText(value) || buf.slice(0, 300)}`));
+            }
             const blocks = Array.isArray(value?.content) ? value.content : [];
             for (const block of blocks) {
               if (block?.type === "text") {
@@ -239,6 +244,12 @@ function anthropicTurn(messages, model, tools, signal, onText, request = default
               }
               if (block?.type === "tool_use") open.set(open.size, { id: block.id, name: block.name, json: JSON.stringify(block.input || {}) });
             }
+          }
+          if (settled) return;
+          if (!text && !open.size) {
+            return fail(new Error(buf.trim()
+              ? `上游返回的不是流式回复：${buf.slice(0, 300)}`
+              : "上游没有返回任何内容"));
           }
           finalize();
         });
@@ -374,7 +385,10 @@ export function createConversationService({ ensureConv, listConvs, log, onChange
             result = await anthropicTurn([...messages, ...follow], turn.model, allowedTools, controller.signal, streamText, request);
           } catch (error) {
             // 上游不支持 tools（不少第三方网关会 400）：退回纯文本一轮。
-            if (step === 0 && allowedTools.length && /tool|schema|unsupported|invalid.?request|400/i.test(error.message)) {
+            // 只认明确的「请求/schema/tools 不支持」措辞，避免消息里恰好带 400 的
+            // 其他错误（如额度、超长）触发无意义的整轮重发。
+            if (step === 0 && allowedTools.length &&
+                /tool|schema|unsupported|invalid_request_error|unexpected.*(field|param)|not.*support/i.test(error.message)) {
               log?.("gateway rejected artifact tools; retrying without tools");
               allowedTools = [];
               result = await anthropicTurn(messages, turn.model, [], controller.signal, streamText, request);
