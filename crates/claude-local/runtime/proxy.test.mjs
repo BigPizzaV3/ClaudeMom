@@ -900,7 +900,29 @@ test("Code channels create projects and keep the id readable through the project
   assert.equal(list.status, 200);
   assert.equal(list.body.channels.some((row) => row.id === created.body.channel.id), true);
 
+  // PATCH 的名称校验与 projects.mjs 同语义：空名/纯空白不落库，超长截到上限，
+  // 否则下次启动 validProject 会把整条项目当损坏数据丢掉。
+  const blank = await request(`/v1/code/channels/${created.body.channel.id}`, {
+    host: "claude.ai", method: "PATCH", body: { name: "   " },
+  });
+  assert.equal(blank.status, 200);
+  assert.equal(blank.body.channel.name, "Channel project", "空白名不改写现有名称");
+  const long = await request(`/v1/code/channels/${created.body.channel.id}`, {
+    host: "claude.ai", method: "PATCH", body: { name: "x".repeat(2000), topic: "t".repeat(70000) },
+  });
+  assert.equal(long.status, 200);
+  assert.equal(long.body.channel.name.length, 200);
+  const reread = await request(`/api/organizations/local/projects/${created.body.channel.id}`, { host: "claude.ai" });
+  assert.equal(reread.status, 200);
+  assert.equal(reread.body.name.length, 200);
+  assert.ok(reread.body.description.length <= 65536);
+
+  // DELETE 走 deleteProject 语义：项目删掉，channels 与 projects 两侧都不再可见。
   await requestText("claude.ai", `/v1/code/channels/${created.body.channel.id}`, {}, "DELETE");
+  const gone = await request(`/api/organizations/local/projects/${created.body.channel.id}`, { host: "claude.ai" });
+  assert.equal(gone.status, 404);
+  const channelsAfter = await request("/v1/code/channels", { host: "claude.ai" });
+  assert.equal(channelsAfter.body.channels.some((row) => row.id === created.body.channel.id), false);
 });
 
 test("project creation dialog dependencies resolve locally instead of hanging upstream", async () => {

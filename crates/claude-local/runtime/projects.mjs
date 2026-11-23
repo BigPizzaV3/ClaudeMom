@@ -795,5 +795,7 @@ export function createProjectApi({ projects, blobs, account, changed, conversati
     return { system: parts.length ? `Project: ${project.name}\n\n${parts.join("\n\n")}` : "", blocks };
   }
 
-  return { handle, context, has: (uuid) => projects.has(uuid) };
+  // remove 即 deleteProject：channelsApi（Code 面板的 DELETE）也必须走这套语义，
+  // 只删 Map 会残留知识 blob、留下悬空的 project_uuid。
+  return { handle, context, has: (uuid) => projects.has(uuid), remove: deleteProject };
 }

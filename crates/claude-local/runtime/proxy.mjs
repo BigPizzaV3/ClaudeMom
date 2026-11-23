@@ -1243,9 +1243,11 @@ function channelsApi(req, res, url, p) {
   if (req.method === "PATCH" || req.method === "PUT") {
     readBody(req, (raw) => {
       const body = decodeJsonBody(req, raw);
-      if (typeof body.name === "string") project.name = body.name;
-      if (typeof body.topic === "string") project.description = body.topic;
-      if (typeof body.description === "string") project.description = body.description;
+      // 名称非空、去空白、限长（本地 projectRecord 截 200）：空串/超长写进
+      // projects.json 会让重启后的列表出现畸形条目。
+      if (typeof body.name === "string" && body.name.trim()) project.name = body.name.trim().slice(0, 200);
+      if (typeof body.topic === "string") project.description = body.topic.slice(0, 65536);
+      if (typeof body.description === "string") project.description = body.description.slice(0, 65536);
       if (body.visibility !== undefined) project.is_private = body.visibility !== "public";
       if (body.icon !== undefined) project.icon = body.icon;
       if (body.color !== undefined) project.color = body.color;
@@ -1257,8 +1259,13 @@ function channelsApi(req, res, url, p) {
     return true;
   }
   if (req.method === "DELETE") {
+    // 删项目的同时清引用：项目内会话的 chat_project_id 保留会指向不存在的项目。
     PROJECTS.delete(id);
+    for (const conv of CONV_STATE.values()) {
+      if (conv.chat_project_id === id) conv.chat_project_id = null;
+    }
     saveProjects();
+    stateStore.flush();
     res.writeHead(204, { "content-length": 0 });
     return res.end(), true;
   }
@@ -1868,23 +1875,8 @@ function mockApi(req, res, url) {
       has_more: cursor + limit < rows.length,
     });
   }
-  // 会话移动的另一个可能形状 /projects/move_conversations 已在 projectsApi 内处理；
-  // 这里保留独立路径以防前端把它打在组织层之外（以日志捕获为准）。
-  if (method === "POST" && /\/move_conversations$/.test(p) && !/\/projects\/move_conversations$/.test(p)) {
-    return readBody(req, (raw) => {
-      const body = decodeJsonBody(req, raw);
-      const target = typeof body.project_uuid === "string" && body.project_uuid ? body.project_uuid : null;
-      const ids = Array.isArray(body.conversation_uuids) ? body.conversation_uuids : [];
-      for (const id of ids) {
-        if (CONV_STATE.has(id)) {
-          CONV_STATE.get(id).chat_project_id = target;
-          CONV_STATE.get(id).updated_at = now();
-        }
-      }
-      stateStore.flush();
-      json(res, { moved: ids.length, project_uuid: target });
-    });
-  }
+  // 会话移动只由 projects.mjs 处理（chat_conversations/move_many 与旧路径
+  // projects/move_conversations 同一实现），proxy 不再重复一份读法不一致的版本。
 
   if (channelsApi(req, res, url, p)) return;
   // 代码会话/环境（epitaxy 路由）：(n ?? Ra).filter 要求字段为数组
@@ -2771,7 +2763,14 @@ function proxyUpstream(req, res, url) {
   });
   // 超时 destroy 会让底层 TLSSocket 在请求结束后再 emit 一次 error：
   // 没有 socket 级监听时 Node 会把它当未处理错误，整个 proxy 直接退出。
-  upstreamReq.on("socket", (socket) => socket.on("error", () => {}));
+  // 连接池是 keepAlive 复用的，"socket" 事件每个请求都会触发一次：按请求叠 on()
+  // 监听器会累积到 MaxListenersExceededWarning（CI 的连接池用例抓过）。
+  // socket 上只挂一次，靠标记防跨请求重复。
+  upstreamReq.on("socket", (socket) => {
+    if (socket.__errorSwallowed) return;
+    socket.__errorSwallowed = true;
+    socket.on("error", () => {});
+  });
   req.pipe(upstreamReq);
 }
 
