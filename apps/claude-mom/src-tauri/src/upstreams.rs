@@ -209,7 +209,7 @@ pub fn save_book(path: &Path, book: &UpstreamBook) -> Result<()> {
 /// cc-switch 的数据库位置，照它自己的规则找：设置里改过配置目录的（`app_paths.json`）优先，
 /// 其次 `~/.cc-switch`；Windows 上默认位置没有时再看 `HOME` 下的旧位置（v3.10.3 留下的）。
 pub fn default_cc_switch_db() -> PathBuf {
-    let Some(dirs) = directories::BaseDirs::new() else {
+    let Some(dirs) = claude_local::user_dirs::BaseDirs::new() else {
         return PathBuf::from(".cc-switch/cc-switch.db");
     };
     let home = dirs.home_dir();
@@ -357,7 +357,7 @@ fn cc_switch_profile(id: &str, name: &str, settings: &str) -> Option<UpstreamPro
 // ── Magpie ─────────────────────────────────────────────────────────────
 
 pub fn default_magpie_dir() -> PathBuf {
-    directories::BaseDirs::new()
+    claude_local::user_dirs::BaseDirs::new()
         .map(|dirs| dirs.home_dir().join(".config").join("magpie"))
         .unwrap_or_else(|| PathBuf::from(".config/magpie"))
 }
@@ -438,7 +438,7 @@ pub fn codex_plus_plus_profile(state_dir: &Path) -> Result<UpstreamProfile> {
 
 /// Codex++ 的状态目录（`~/.codex-session-delete`）。
 pub fn codex_plus_plus_state_dir() -> PathBuf {
-    directories::BaseDirs::new()
+    claude_local::user_dirs::BaseDirs::new()
         .map(|dirs| dirs.home_dir().join(".codex-session-delete"))
         .unwrap_or_else(|| PathBuf::from(".codex-session-delete"))
 }

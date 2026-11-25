@@ -15,6 +15,7 @@ pub mod settings;
 pub mod sysproxy;
 #[doc(hidden)]
 pub mod test_sandbox;
+pub mod user_dirs;
 #[cfg(windows)]
 pub mod winproc;
 

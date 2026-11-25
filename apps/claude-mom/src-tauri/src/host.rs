@@ -16,7 +16,7 @@ pub fn state_dir() -> PathBuf {
     {
         return dir;
     }
-    directories::BaseDirs::new()
+    claude_local::user_dirs::BaseDirs::new()
         .map(|dirs| dirs.home_dir().join(".claude-mom"))
         .unwrap_or_else(|| PathBuf::from(".claude-mom"))
 }

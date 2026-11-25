@@ -10,7 +10,8 @@
 //!
 //! 新增测试程序（`src` 下的单元测试根、`tests/*.rs`）都要接上，本文件里的契约测试会查。
 //! 和 Codex++ 的 `codex_plus_core::test_sandbox` 是同一套做法。
-//! Windows 上 `directories` 走系统的已知文件夹接口、不看环境变量，这里只能顾到读环境变量的那些路径。
+//! Windows 上 `directories` 走系统的已知文件夹接口、不看环境变量：所以代码里的用户目录统一走
+//! [`crate::user_dirs`]，它看到 [`active_home`] 就改按沙箱推导（契约测试也查没有绕过它的）。
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -73,6 +74,18 @@ pub fn enter() -> &'static Path {
     })
 }
 
+/// 沙箱里的家目录：本进程（或起它的测试进程）进了沙箱、家目录也还在沙箱根下时返回，否则 None。
+///
+/// 按环境变量判断而不是只看本进程有没有调过 [`enter`]：测试起的子进程也要落在沙箱里。
+/// 正式运行时没有这个标记，开销只是读一次环境变量。
+pub fn active_home() -> Option<PathBuf> {
+    let root = PathBuf::from(std::env::var_os(MARKER)?);
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)?;
+    home.starts_with(&root).then_some(home)
+}
+
 /// 当前进程的沙箱根目录（没进沙箱时为 None）。
 pub fn root() -> Option<&'static Path> {
     SANDBOX.get().map(PathBuf::as_path)
@@ -87,6 +100,53 @@ mod tests {
         let root = super::root().expect("测试程序没有进家目录沙箱");
         let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
         assert!(home.starts_with(root), "HOME 没有指到沙箱：{}", home.display());
+        // 用户目录统一走 user_dirs：沙箱里按沙箱推导（Windows 上 directories 不看环境变量，只能靠这里挡住）。
+        let dirs = crate::user_dirs::BaseDirs::new().expect("user_dirs");
+        for path in [dirs.home_dir(), dirs.config_dir(), dirs.data_dir(), dirs.data_local_dir()] {
+            assert!(path.starts_with(root), "用户目录没落在沙箱里：{}", path.display());
+        }
+    }
+
+    fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Windows 上 `directories` / 已知文件夹接口不看环境变量，沙箱挡不住：代码里的用户目录只能经 `user_dirs` 取。
+    #[test]
+    fn nothing_bypasses_user_dirs() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut files = Vec::new();
+        for member in ["crates/claude-local", "apps/claude-mom/src-tauri"] {
+            for sub in ["src", "examples", "tests"] {
+                rust_files(&workspace.join(member).join(sub), &mut files);
+            }
+        }
+        assert!(files.len() > 10, "没找到源文件");
+        let allowed = |path: &Path| path.ends_with("src/user_dirs.rs") || path.ends_with("src/test_sandbox.rs");
+        let offenders: Vec<_> = files
+            .iter()
+            .filter(|path| !allowed(path))
+            .filter(|path| {
+                // 注释里提到不算。
+                std::fs::read_to_string(path).unwrap_or_default().lines().any(|line| {
+                    let code = line.trim_start();
+                    !code.starts_with("//") && (code.contains("directories::") || code.contains("SHGetKnownFolderPath("))
+                })
+            })
+            .map(|path| path.strip_prefix(&workspace).unwrap_or(path).display().to_string())
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "这些文件绕过了 claude_local::user_dirs 直接取用户目录，Windows 上测试沙箱挡不住：{offenders:?}"
+        );
     }
 
     /// 每个测试程序的根文件：工作区成员带单元测试的 `src/lib.rs` / `src/main.rs`，以及 `tests/*.rs`、`tests/*/main.rs`。

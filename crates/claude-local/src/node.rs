@@ -48,7 +48,7 @@ fn bundled_nodes() -> Vec<PathBuf> {
         paths.push(PathBuf::from(
             "/Applications/Codex.app/Contents/Resources/cua_node/bin/node",
         ));
-        if let Some(base) = directories::BaseDirs::new() {
+        if let Some(base) = crate::user_dirs::BaseDirs::new() {
             paths.push(
                 base.home_dir()
                     .join("Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"),
@@ -73,7 +73,7 @@ fn program_candidates(name: &str) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
         .unwrap_or_default();
-    if let Some(base) = directories::BaseDirs::new() {
+    if let Some(base) = crate::user_dirs::BaseDirs::new() {
         for extra in [".local/bin", ".volta/bin", ".npm-global/bin", ".bun/bin"] {
             dirs.push(base.home_dir().join(extra));
         }

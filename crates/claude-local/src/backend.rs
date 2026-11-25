@@ -191,7 +191,7 @@ pub(crate) fn root_dir() -> PathBuf {
 }
 
 fn home_dir() -> PathBuf {
-    directories::BaseDirs::new()
+    crate::user_dirs::BaseDirs::new()
         .map(|base| base.home_dir().to_path_buf())
         .unwrap_or_default()
 }
@@ -289,7 +289,7 @@ fn full_code_dir(root: &Path) -> PathBuf {
 }
 
 fn shared_full_code_dir() -> Option<PathBuf> {
-    directories::BaseDirs::new()
+    crate::user_dirs::BaseDirs::new()
         .map(|dirs| dirs.home_dir().join(".claude-desktop-local").join("claude-code"))
 }
 

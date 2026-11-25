@@ -56,7 +56,7 @@ pub fn model_dir() -> PathBuf {
     let home = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute() && path.is_dir())
-        .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().join(".codex")))
+        .or_else(|| crate::user_dirs::BaseDirs::new().map(|dirs| dirs.home_dir().join(".codex")))
         .unwrap_or_else(|| PathBuf::from(".codex"));
     home.join("speech-to-text").join("sensevoice-onnx")
 }
