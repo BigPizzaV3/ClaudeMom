@@ -21,6 +21,7 @@ use crate::settings::ClaudeLocalSettings;
 const HEALTH_PATH: &str = "/__codex_claude_local/health";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const START_TIMEOUT: Duration = Duration::from_secs(12);
+const DICTATION_PREPARE_TIMEOUT: Duration = Duration::from_secs(90);
 static OPERATION: Mutex<()> = Mutex::new(());
 
 // 录制版模板（每个前端版本一组，脱敏后的接口数据 + 同一次录制的页面外壳）：由 build.rs 从
@@ -1900,6 +1901,13 @@ fn wait_backend_ready(
 fn prepare_dictation(root: &Path, node: &Path) -> Result<()> {
     let cache = root.join(".cache");
     private_dir(&cache)?;
+    let upstream_proxy = upstream_web_proxy();
+    let node_supports_env_proxy = upstream_proxy.is_some()
+        && probe(
+            hidden_command(node).args(["--use-env-proxy", "-e", "process.exit(0)"]),
+            PROBE_TIMEOUT,
+        )
+        .is_ok_and(|(success, _)| success);
     // 各 profile 组的 electron 缓存目录都要试（Windows 可能 classic + MSIX 多组）；
     // 只取已存在的，都不存在就用主集合的那份保持原语义。
     let sets = profile_sets();
@@ -1915,30 +1923,38 @@ fn prepare_dictation(root: &Path, node: &Path) -> Result<()> {
     }
     let mut last_error = None;
     for electron_cache in electron_caches {
-        let drain = probe(
-            hidden_command(node)
-                .arg(root.join("scripts/patch-dictation-drain.mjs"))
-                .args(["--apply", "--cache-dir"])
-                .arg(&cache)
-                .arg("--electron-cache-dir")
-                .arg(&electron_cache)
-                .env("CLAUDE_LOCAL_MODE", "mock"),
-            Duration::from_secs(20),
+        let mut drain_command = hidden_command(node);
+        set_node_proxy_environment(
+            &mut drain_command,
+            upstream_proxy.as_deref(),
+            node_supports_env_proxy,
         );
-        let code = "const m=await import(process.argv[1]);m.applyStartupPatches({cacheDir:process.argv[2],electronCacheDir:process.argv[3]});";
-        let start = probe(
-            hidden_command(node)
-                .args(["--input-type=module", "-e", code])
-                .arg(
-                    url::Url::from_file_path(root.join("scripts/patch-dictation-start.mjs"))
-                        .map_err(|_| anyhow::anyhow!("听写资源路径无效"))?
-                        .as_str(),
-                )
-                .arg(&cache)
-                .arg(&electron_cache)
-                .env("CLAUDE_LOCAL_MODE", "mock"),
-            Duration::from_secs(20),
+        drain_command
+            .arg(root.join("scripts/patch-dictation-drain.mjs"))
+            .args(["--apply", "--cache-dir"])
+            .arg(&cache)
+            .arg("--electron-cache-dir")
+            .arg(&electron_cache)
+            .env("CLAUDE_LOCAL_MODE", "mock");
+        let drain = probe(&mut drain_command, DICTATION_PREPARE_TIMEOUT);
+        let code = "const m=await import(process.argv[1]);await m.applyStartupPatches({cacheDir:process.argv[2],electronCacheDir:process.argv[3]});";
+        let mut command = hidden_command(node);
+        set_node_proxy_environment(
+            &mut command,
+            upstream_proxy.as_deref(),
+            node_supports_env_proxy,
         );
+        command
+            .args(["--input-type=module", "-e", code])
+            .arg(
+                url::Url::from_file_path(root.join("scripts/patch-dictation-start.mjs"))
+                    .map_err(|_| anyhow::anyhow!("听写资源路径无效"))?
+                    .as_str(),
+            )
+            .arg(&cache)
+            .arg(&electron_cache)
+            .env("CLAUDE_LOCAL_MODE", "mock");
+        let start = probe(&mut command, DICTATION_PREPARE_TIMEOUT);
         if drain.is_ok_and(|(success, _)| success) && start.is_ok_and(|(success, _)| success) {
             write_private(&root.join("compatibility-warning.txt"), b"")?;
             return Ok(());
@@ -1950,6 +1966,15 @@ fn prepare_dictation(root: &Path, node: &Path) -> Result<()> {
         last_error.unwrap_or_default().as_bytes(),
     )?;
     Ok(())
+}
+
+fn set_node_proxy_environment(command: &mut Command, proxy: Option<&str>, use_env_proxy: bool) {
+    if let Some(proxy) = proxy {
+        command.env("HTTP_PROXY", proxy).env("HTTPS_PROXY", proxy);
+    }
+    if use_env_proxy {
+        command.arg("--use-env-proxy");
+    }
 }
 
 fn start_backend(
@@ -2744,6 +2769,30 @@ mod tests {
         assert_eq!(pick_upstream_web_proxy(some("socks5://127.0.0.1:7898"), some("http://127.0.0.1:7897")), some("http://127.0.0.1:7897"));
         assert_eq!(pick_upstream_web_proxy(some("socks5://127.0.0.1:7898"), None), None);
         assert_eq!(pick_upstream_web_proxy(None, None), None);
+    }
+
+    #[test]
+    fn dictation_asset_preparation_passes_detected_proxy_to_supported_node() {
+        let mut command = Command::new("node");
+        set_node_proxy_environment(&mut command, Some("http://proxy.example.test:3128"), true);
+        assert_eq!(
+            command
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            ["--use-env-proxy"],
+        );
+        let environment = command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(environment.get("HTTP_PROXY").and_then(Option::as_deref), Some("http://proxy.example.test:3128"));
+        assert_eq!(environment.get("HTTPS_PROXY").and_then(Option::as_deref), Some("http://proxy.example.test:3128"));
     }
 
     /// Desktop 更新（app.asar 变了）算配置变化：本地服务要重启才能换上新的官方页面。

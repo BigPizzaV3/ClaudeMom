@@ -60,7 +60,7 @@ test("Electron cache extraction validates URL and HTTP body length", () => {
   assert.throws(() => extractElectronCacheAsset(Buffer.from(`1/0/${assetUrl}short\0HTTP/1.1 200 OK\0content-length: 9999\0`)), /bounds/);
 });
 
-test("local asset patch is idempotent and reversible", () => {
+test("local asset patch is idempotent and reversible", async () => {
   const root = tempDir();
   try {
     const cacheDir = path.join(root, "proxy-cache");
@@ -68,21 +68,68 @@ test("local asset patch is idempotent and reversible", () => {
     fs.mkdirSync(electronCacheDir);
     fs.writeFileSync(path.join(electronCacheDir, "entry_0"), fixtureElectronEntry(fixtureBundle()));
 
-    assert.equal(applyPatch({ cacheDir, electronCacheDir }), "patched");
-    assert.equal(applyPatch({ cacheDir, electronCacheDir }), "already-patched");
+    assert.equal(await applyPatch({ cacheDir, electronCacheDir }), "patched");
+    assert.equal(await applyPatch({ cacheDir, electronCacheDir }), "already-patched");
     const assetName = crypto.createHash("sha1").update(assetKey).digest("hex");
     const assetPath = path.join(cacheDir, assetName);
     const patched = fs.readFileSync(assetPath);
     assert.match(patched.toString(), /D=125e3,A=6e4/);
     assert.equal(restorePatch({ cacheDir }), "restored");
     assert.deepEqual(fs.readFileSync(assetPath), fixtureBundle());
-    assert.equal(applyPatch({ cacheDir, electronCacheDir }), "patched");
+    assert.equal(await applyPatch({ cacheDir, electronCacheDir }), "patched");
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("local asset cache upgrades the previous 30-second patch without replacing its backup", () => {
+test("missing Electron cache asset downloads, validates, patches, and retains a reversible original", async () => {
+  const root = tempDir();
+  try {
+    const cacheDir = path.join(root, "proxy-cache");
+    const electronCacheDir = path.join(root, "electron-cache");
+    let requestedUrl = "";
+    const original = fixtureBundle();
+    const fetchAsset = async (url) => {
+      requestedUrl = url;
+      return new Response(original, {
+        status: 200,
+        headers: { "content-type": "text/javascript; charset=utf-8" },
+      });
+    };
+
+    assert.equal(await applyPatch({ cacheDir, electronCacheDir, fetchAsset }), "patched");
+    assert.equal(requestedUrl, assetUrl);
+    const assetName = crypto.createHash("sha1").update(assetKey).digest("hex");
+    const assetPath = path.join(cacheDir, assetName);
+    const backupPath = path.join(cacheDir, ".dictation-drain-backup", assetName);
+    assert.match(fs.readFileSync(assetPath, "utf8"), /D=125e3,A=6e4/);
+    assert.deepEqual(fs.readFileSync(backupPath), original);
+    assert.equal(restorePatch({ cacheDir }), "restored");
+    assert.deepEqual(fs.readFileSync(assetPath), original);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an unsupported downloaded drain asset is refused without writing cache files", async () => {
+  const root = tempDir();
+  try {
+    const cacheDir = path.join(root, "proxy-cache");
+    const fetchAsset = async () => new Response("unsupported asset", {
+      status: 200,
+      headers: { "content-type": "text/javascript; charset=utf-8" },
+    });
+    await assert.rejects(
+      applyPatch({ cacheDir, electronCacheDir: path.join(root, "missing-electron-cache"), fetchAsset }),
+      /does not match/,
+    );
+    assert.equal(fs.existsSync(cacheDir), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("local asset cache upgrades the previous 30-second patch without replacing its backup", async () => {
   const root = tempDir();
   try {
     const cacheDir = path.join(root, "proxy-cache");
@@ -98,7 +145,7 @@ test("local asset cache upgrades the previous 30-second patch without replacing 
     fs.writeFileSync(assetPath, previousPatch);
     fs.writeFileSync(`${assetPath}.json`, JSON.stringify(metadata));
 
-    assert.equal(applyPatch({ cacheDir, electronCacheDir: path.join(root, "unused") }), "updated");
+    assert.equal(await applyPatch({ cacheDir, electronCacheDir: path.join(root, "unused") }), "updated");
     assert.match(fs.readFileSync(assetPath, "utf8"), /D=125e3,A=6e4/);
     assert.equal(restorePatch({ cacheDir }), "restored");
     assert.deepEqual(fs.readFileSync(assetPath), fixtureBundle());

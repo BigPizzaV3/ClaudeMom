@@ -214,6 +214,7 @@ export function extractElectronStartupAsset(bytes, asset) {
 }
 
 function readElectronAsset(cacheDir, asset) {
+  if (!fs.existsSync(cacheDir)) return null;
   const matches = [];
   for (const entry of fs.readdirSync(cacheDir, { withFileTypes: true })) {
     if (!entry.isFile() || !entry.name.endsWith("_0")) continue;
@@ -223,7 +224,7 @@ function readElectronAsset(cacheDir, asset) {
     asset.patch(body);
     matches.push(body);
   }
-  if (!matches.length) throw new Error(`Expected dictation startup asset is missing: ${asset.name}`);
+  if (!matches.length) return null;
   if (matches.some((body) => !body.equals(matches[0]))) throw new Error("Multiple different dictation startup assets are cached");
   return {
     body: matches[0],
@@ -238,20 +239,67 @@ function writeAsset(bodyPath, metaPath, { body, meta }) {
 
 const defaultElectronCache = path.join(os.homedir(), "Library", "Application Support", "Claude", "Cache", "Cache_Data");
 
-export function applyStartupPatches({ cacheDir = path.join(here, ".cache"), electronCacheDir = defaultElectronCache } = {}) {
+async function downloadAsset(asset, fetchAsset) {
+  const response = await fetchAsset(asset.url, {
+    redirect: "error",
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (response.status !== 200) {
+    throw new Error(`Dictation startup asset download failed: HTTP ${response.status}`);
+  }
+  const contentLength = Number(response.headers.get("content-length") ?? 0);
+  if (Number.isFinite(contentLength) && contentLength > 8 * 1024 * 1024) {
+    throw new Error("Dictation startup asset download exceeds the size limit");
+  }
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of response.body ?? []) {
+    size += chunk.length;
+    if (size > 8 * 1024 * 1024) {
+      throw new Error("Dictation startup asset download exceeds the size limit");
+    }
+    chunks.push(Buffer.from(chunk));
+  }
+  const body = Buffer.concat(chunks, size);
+  if (!body.length || body.length > 8 * 1024 * 1024) {
+    throw new Error("Dictation startup asset download returned an invalid size");
+  }
+  const contentType = response.headers.get("content-type");
+  if (!/^text\/javascript(?:;|$)|^application\/(?:javascript|ecmascript)(?:;|$)/i.test(contentType ?? "")) {
+    throw new Error("Dictation startup asset download has an invalid content type");
+  }
+  return {
+    body,
+    meta: {
+      status: 200,
+      url: asset.url.replace(/^https:\/\//, ""),
+      headers: {
+        "content-type": contentType,
+        "content-length": String(body.length),
+        "cache-control": "no-store",
+      },
+    },
+  };
+}
+
+export async function applyStartupPatches({
+  cacheDir = path.join(here, ".cache"),
+  electronCacheDir = defaultElectronCache,
+  fetchAsset = fetch,
+} = {}) {
   // 先验证全部资源与备份，再写入，避免版本不匹配时留下部分补丁。
-  const prepared = startupAssets.map((asset) => {
+  const prepared = await Promise.all(startupAssets.map(async (asset) => {
     const paths = pathsFor(cacheDir, asset);
     const current = fs.existsSync(paths.body) || fs.existsSync(paths.meta)
       ? readAssetCache(paths.body, paths.meta, paths.key)
-      : readElectronAsset(electronCacheDir, asset);
+      : readElectronAsset(electronCacheDir, asset) ?? await downloadAsset(asset, fetchAsset);
     const patched = asset.patch(current.body);
     const hasBackup = fs.existsSync(paths.backupBody) || fs.existsSync(paths.backupMeta);
     const original = hasBackup ? readAssetCache(paths.backupBody, paths.backupMeta, paths.key) : current;
     if (original.body.includes(Buffer.from(patchMarker))) throw new Error("Dictation startup asset has no original reversible backup");
     if (!asset.patch(original.body).equals(patched)) throw new Error("Dictation startup asset backup does not match the local asset");
     return { asset, paths, original, patched, hasBackup, unchanged: current.body.equals(patched) };
-  });
+  }));
   for (const { paths, original, patched, hasBackup } of prepared) {
     fs.mkdirSync(paths.backupDir, { recursive: true, mode: 0o700 });
     if (!hasBackup) writeAsset(paths.backupBody, paths.backupMeta, original);
@@ -279,7 +327,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     if (args[0] === "--apply" && process.env.CLAUDE_LOCAL_MODE !== "mock") {
       throw new Error("Applying dictation startup patches requires CLAUDE_LOCAL_MODE=mock");
     }
-    const result = args[0] === "--apply" ? applyStartupPatches() : restoreStartupPatches();
+    const result = args[0] === "--apply" ? await applyStartupPatches() : restoreStartupPatches();
     console.log(`Claude local dictation startup assets: ${JSON.stringify(result)}`);
   } catch (error) {
     console.error(`Claude local dictation startup patch refused: ${error.message}`);

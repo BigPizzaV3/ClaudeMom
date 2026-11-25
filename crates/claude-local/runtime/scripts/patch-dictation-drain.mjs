@@ -112,7 +112,7 @@ function validateMeta(meta) {
 }
 
 function locateElectronAsset(cacheDir, expectedUrl = assetUrl) {
-  if (!fs.existsSync(cacheDir)) throw new Error("Electron HTTP cache directory was not found");
+  if (!fs.existsSync(cacheDir)) return null;
   const matches = [];
   for (const entry of fs.readdirSync(cacheDir, { withFileTypes: true })) {
     if (!entry.isFile() || !entry.name.endsWith("_0")) continue;
@@ -121,7 +121,7 @@ function locateElectronAsset(cacheDir, expectedUrl = assetUrl) {
     if (!bytes.includes(Buffer.from(expectedUrl, "utf8"))) continue;
     matches.push(extractElectronCacheAsset(bytes, expectedUrl));
   }
-  if (matches.length === 0) throw new Error("The expected dictation asset is not present in Electron's cache");
+  if (matches.length === 0) return null;
   const first = matches[0];
   if (matches.some((body) => !body.equals(first))) {
     throw new Error("Multiple different versions of the dictation asset are cached");
@@ -145,9 +145,56 @@ function writeMetadata(filePath, metadata) {
   fs.writeFileSync(filePath, `${JSON.stringify(metadata)}\n`, { mode: 0o600 });
 }
 
-export function applyPatch({ cacheDir = path.join(here, ".cache"), electronCacheDir = electronCacheDefault } = {}) {
+async function downloadAsset(fetchAsset) {
+  const response = await fetchAsset(assetUrl, {
+    redirect: "error",
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (response.status !== 200) {
+    throw new Error(`Dictation drain asset download failed: HTTP ${response.status}`);
+  }
+  const contentLength = Number(response.headers.get("content-length") ?? 0);
+  if (Number.isFinite(contentLength) && contentLength > 8 * 1024 * 1024) {
+    throw new Error("Dictation drain asset download exceeds the size limit");
+  }
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of response.body ?? []) {
+    size += chunk.length;
+    if (size > 8 * 1024 * 1024) {
+      throw new Error("Dictation drain asset download exceeds the size limit");
+    }
+    chunks.push(Buffer.from(chunk));
+  }
+  const body = Buffer.concat(chunks, size);
+  if (!body.length || body.length > 8 * 1024 * 1024) {
+    throw new Error("Dictation drain asset download returned an invalid size");
+  }
+  const contentType = response.headers.get("content-type");
+  if (!/^text\/javascript(?:;|$)|^application\/(?:javascript|ecmascript)(?:;|$)/i.test(contentType ?? "")) {
+    throw new Error("Dictation drain asset download has an invalid content type");
+  }
+  patchDictationBundle(body);
+  return {
+    body,
+    meta: {
+      status: 200,
+      headers: {
+        "content-type": contentType,
+        "content-length": String(body.length),
+        "cache-control": "no-store",
+      },
+      url: assetKey,
+    },
+  };
+}
+
+export async function applyPatch({
+  cacheDir = path.join(here, ".cache"),
+  electronCacheDir = electronCacheDefault,
+  fetchAsset = fetch,
+} = {}) {
   const paths = cachePaths(cacheDir);
-  fs.mkdirSync(cacheDir, { recursive: true });
 
   let originalBody;
   let originalMeta;
@@ -191,11 +238,17 @@ export function applyPatch({ cacheDir = path.join(here, ".cache"), electronCache
     if (fs.existsSync(paths.bodyPath) || fs.existsSync(paths.metaPath)) {
       throw new Error("Local asset cache is incomplete");
     }
-    originalBody = locateElectronAsset(electronCacheDir);
-    originalMeta = cacheMetadata(originalBody);
+    const cached = locateElectronAsset(electronCacheDir);
+    if (cached) {
+      originalBody = cached;
+      originalMeta = cacheMetadata(originalBody);
+    } else {
+      ({ body: originalBody, meta: originalMeta } = await downloadAsset(fetchAsset));
+    }
   }
 
   const patchedBody = patchDictationBundle(originalBody);
+  fs.mkdirSync(cacheDir, { recursive: true });
   fs.mkdirSync(paths.backupDir, { recursive: true, mode: 0o700 });
   if (fs.existsSync(paths.backupBodyPath) || fs.existsSync(paths.backupMetaPath)) {
     if (!fs.existsSync(paths.backupBodyPath) || !fs.existsSync(paths.backupMetaPath)) {
@@ -254,7 +307,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
       throw new Error("Applying the dictation asset patch requires CLAUDE_LOCAL_MODE=mock");
     }
     const result = options.action === "apply"
-      ? applyPatch(options)
+      ? await applyPatch(options)
       : restorePatch(options);
     console.log(`Claude local dictation asset: ${result}`);
   } catch (error) {

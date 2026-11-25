@@ -335,7 +335,7 @@ test("Electron Simple Cache v5 matches only the declared key and validates the s
   assert.throws(() => extractElectronStartupAsset(bytes.subarray(0, keyEnd + Buffer.byteLength(source)), asset), /body bounds/);
 });
 
-test("both startup assets are prepared before writes and can be restored without changing Electron cache", () => {
+test("both startup assets are prepared before writes and can be restored without changing Electron cache", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "claude-startup-patch-"));
   try {
     const cacheDir = path.join(root, "proxy");
@@ -347,8 +347,8 @@ test("both startup assets are prepared before writes and can be restored without
     for (const [index, asset] of startupAssets.entries()) {
       fs.writeFileSync(path.join(electronCacheDir, `${index}_0`), electronEntry(asset.url, fixtures[index]));
     }
-    assert.deepEqual(applyStartupPatches({ cacheDir, electronCacheDir }).map(({ status }) => status), ["patched", "patched"]);
-    assert.deepEqual(applyStartupPatches({ cacheDir, electronCacheDir }).map(({ status }) => status), ["already-patched", "already-patched"]);
+    assert.deepEqual((await applyStartupPatches({ cacheDir, electronCacheDir })).map(({ status }) => status), ["patched", "patched"]);
+    assert.deepEqual((await applyStartupPatches({ cacheDir, electronCacheDir })).map(({ status }) => status), ["already-patched", "already-patched"]);
     assert.equal(restoreStartupPatches({ cacheDir }), "restored");
     for (const [index, asset] of startupAssets.entries()) {
       const key = asset.url.replace(/^https:\/\//, "");
@@ -362,7 +362,66 @@ test("both startup assets are prepared before writes and can be restored without
   }
 });
 
-test("an unsupported second asset is refused before writing any local patched asset", () => {
+test("missing Electron cache assets download, validate, patch, and retain reversible originals", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "claude-startup-download-"));
+  try {
+    const cacheDir = path.join(root, "proxy");
+    const electronCacheDir = path.join(root, "electron");
+    fs.mkdirSync(electronCacheDir);
+    const fixtures = [recorderFixture, facadeFixture];
+    const fetched = [];
+    const fetchAsset = async (url) => {
+      fetched.push(url);
+      const index = startupAssets.findIndex((asset) => asset.url === url);
+      assert.notEqual(index, -1);
+      return new Response(fixtures[index], {
+        status: 200,
+        headers: { "content-type": "text/javascript; charset=utf-8" },
+      });
+    };
+
+    assert.deepEqual(
+      (await applyStartupPatches({ cacheDir, electronCacheDir, fetchAsset })).map(({ status }) => status),
+      ["patched", "patched"],
+    );
+    assert.equal(fetched.length, startupAssets.length);
+    for (const [index, asset] of startupAssets.entries()) {
+      const { bodyPath, backupPath, meta } = pathsForTest(cacheDir, asset);
+      assert.equal(meta.contentType, "text/javascript; charset=utf-8");
+      const body = fs.readFileSync(bodyPath);
+      assert.equal(body.includes(Buffer.from("codex-local-dictation-start-v1")), true);
+      assert.deepEqual(fs.readFileSync(backupPath), Buffer.from(fixtures[index]));
+      assert.equal(isPatchedStartupAsset(asset.pathname, body), true);
+    }
+    assert.deepEqual(fs.readdirSync(electronCacheDir), []);
+    assert.equal(restoreStartupPatches({ cacheDir }), "restored");
+    assert.deepEqual(
+      startupAssets.map((asset) => {
+        const key = asset.url.replace(/^https:\/\//, "");
+        const name = crypto.createHash("sha1").update(key).digest("hex");
+        return fs.readFileSync(path.join(cacheDir, name));
+      }),
+      fixtures.map((fixture) => Buffer.from(fixture)),
+    );
+  } finally {
+    removeFixtureTree(root);
+  }
+});
+
+function pathsForTest(cacheDir, asset) {
+  const key = asset.url.replace(/^https:\/\//, "");
+  const name = crypto.createHash("sha1").update(key).digest("hex");
+  const bodyPath = path.join(cacheDir, name);
+  return {
+    bodyPath,
+    backupPath: path.join(cacheDir, ".dictation-start-backup", name),
+    meta: {
+      contentType: JSON.parse(fs.readFileSync(`${bodyPath}.json`, "utf8")).headers["content-type"],
+    },
+  };
+}
+
+test("an unsupported second asset is refused before writing any local patched asset", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "claude-startup-refused-"));
   try {
     const cacheDir = path.join(root, "proxy");
@@ -371,7 +430,7 @@ test("an unsupported second asset is refused before writing any local patched as
     for (const [index, asset] of startupAssets.entries()) {
       fs.writeFileSync(path.join(electronCacheDir, `${index}_0`), electronEntry(asset.url, index === 0 ? recorderFixture : "unsupported version"));
     }
-    assert.throws(() => applyStartupPatches({ cacheDir, electronCacheDir }), /does not match/);
+    await assert.rejects(applyStartupPatches({ cacheDir, electronCacheDir }), /does not match/);
     assert.equal(fs.existsSync(cacheDir), false);
   } finally {
     removeFixtureTree(root);
