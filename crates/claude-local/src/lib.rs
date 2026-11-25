@@ -13,6 +13,8 @@ pub mod node;
 pub mod session_sync;
 pub mod settings;
 pub mod sysproxy;
+#[doc(hidden)]
+pub mod test_sandbox;
 #[cfg(windows)]
 pub mod winproc;
 
@@ -30,3 +32,10 @@ pub use settings::ClaudeLocalSettings;
 /// Windows 上启动子进程不弹控制台窗口。
 #[cfg(windows)]
 pub const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+/// 测试不许碰用户的真实目录：main 之前进家目录沙箱（见 `claude_local::test_sandbox`）。
+#[cfg(test)]
+#[ctor::ctor]
+fn enter_test_sandbox() {
+    test_sandbox::enter();
+}
